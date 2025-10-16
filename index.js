@@ -3,8 +3,8 @@
 // NOTE: No KV. All storage is in-memory (globalThis). Will be lost on restart/redeploy.
 // Recommended: set BOT_TOKEN and ADMIN_ID as secrets in Wrangler (env.BOT_TOKEN, env.ADMIN_ID).
 
-const FALLBACK_TOKEN = "7522192709:AAFDwX-Lng-_3FUtr6oAiFu-nfD_XLMCsd8"; // fallback only (not recommended)
-const FALLBACK_ADMIN = 7729648778; // fallback admin id if env not set
+const FALLBACK_TOKEN = "7819500627:AAGR8QKx4G7J-HMBczMVj3GT3aTBgcBLmlo"; // fallback only (not recommended)
+const FALLBACK_ADMIN = 5560906270; // fallback admin id if env not set
 const QRIS_LINK = "https://raw.githubusercontent.com/Sigitbaberon/qris/refs/heads/main/qr_ID1025423347687_29.09.25_175910930_1759109315016.jpeg";
 const LICENSE_VALID_DAYS = 30;
 const MS_IN_DAY = 24 * 3600 * 1000;
