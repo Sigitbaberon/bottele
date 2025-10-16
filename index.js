@@ -1,6 +1,5 @@
-// bot-satpam-lisensi-fix-nospam.js
-// ✅ Versi fix anti-spam loop Telegram
-// Bot Satpam Berlisensi (Cloudflare Worker) — by GPT-5
+// Satpam Bot Berlisensi (Final Version - Cloudflare KV Ready)
+// KV ID: 236d68b5c6964ee79fc7f0afbda2340e
 
 const TOKEN = "7819500627:AAGR8QKx4G7J-HMBczMVj3GT3aTBgcBLmlo";
 const ADMIN_IDS = [5560906270];
@@ -9,89 +8,59 @@ const QRIS_LINK = "https://raw.githubusercontent.com/Sigitbaberon/qris/refs/head
 const LICENSE_DAYS = 30;
 const DAY_MS = 24 * 3600 * 1000;
 
-// --- Memory storage (non-KV)
-if (!globalThis.DB) {
-  globalThis.DB = {
-    HANDLED: new Set(),   // untuk mencegah spam / loop
-    PENDING: {},
-    LICENSES: {},
-  };
-}
-
 export default {
-  async fetch(req) {
-    if (req.method !== "POST") return new Response("Bot aktif ✅");
-    const update = await req.json();
+  async fetch(req, env) {
+    if (req.method !== "POST") return new Response("✅ Satpam Bot dengan KV aktif");
 
-    // Ambil data update
+    const update = await req.json();
     const msg = update.message;
     if (!msg) return new Response("No message");
 
-    const idKey = `${msg.chat.id}-${msg.message_id}`;
-    if (globalThis.DB.HANDLED.has(idKey)) return new Response("Duplicate ignored");
-    globalThis.DB.HANDLED.add(idKey);
+    const key = `${msg.chat.id}-${msg.message_id}`;
+    if (await env.DB.get(key)) return new Response("duplicate ignored");
+    await env.DB.put(key, "1", { expirationTtl: 60 });
 
-    try {
-      await handleMessage(msg);
-    } catch (err) {
-      console.error("Bot error:", err);
-      await safeSend(ADMIN_IDS[0], `❗Error: ${err.message}`);
-    }
-
-    // ⚡ Telegram butuh respon cepat
+    await handleMessage(msg, env);
     return new Response("ok", { status: 200 });
   },
 };
 
-// === CORE ===
-async function handleMessage(msg) {
+// === CORE HANDLER ===
+async function handleMessage(msg, env) {
   const chatId = msg.chat.id;
-  const from = msg.from || {};
-  const userId = from.id;
+  const userId = msg.from.id;
+  const username = msg.from.username || "";
+  const name = msg.from.first_name || "";
   const text = (msg.text || "").trim();
   const isPrivate = msg.chat.type === "private";
   const isAdmin = ADMIN_IDS.includes(userId);
 
-  // === PRIVATE CHAT ===
+  // === PRIVATE ===
   if (isPrivate) {
     // /start
     if (text === "/start") {
-      await sendMessage(
-        chatId,
-        `👋 Halo ${from.first_name || "teman"}!\n\n` +
-          `Bot ini adalah *Satpam Grup* dengan sistem lisensi berlangganan.\n` +
-          `Untuk aktivasi, silakan bayar lewat QRIS di bawah lalu kirim bukti transfer ke sini.`,
-        "Markdown"
-      );
-      await sendPhoto(chatId, QRIS_LINK, "📷 Scan QRIS di atas untuk membayar lisensi 30 hari.");
+      await sendMessage(chatId,
+        `👋 Halo ${name}!\n\n` +
+        `Bot ini adalah *Satpam Grup Berlisensi*.\n` +
+        `Untuk aktivasi lisensi, silakan bayar via QRIS berikut lalu kirim bukti transfer.`, "Markdown");
+      await sendPhoto(chatId, QRIS_LINK, "📷 Scan QRIS di atas untuk bayar lisensi 30 hari.");
       return;
     }
 
-    // Foto bukti pembayaran
+    // Upload bukti pembayaran
     if (msg.photo) {
       const largest = msg.photo[msg.photo.length - 1];
       const code = genCode();
-      globalThis.DB.PENDING[userId] = {
-        userId,
-        username: from.username || "",
+      const pending = {
+        userId, username, name,
         fileId: largest.file_id,
-        code,
-        ts: Date.now(),
+        code, ts: Date.now()
       };
+      await env.DB.put(`pending:${userId}`, JSON.stringify(pending));
       await sendMessage(chatId, `✅ Bukti diterima!\nKode verifikasi: \`${code}\`\nTunggu admin menyetujuinya.`, "Markdown");
       for (const adminId of ADMIN_IDS) {
-        await sendMessage(adminId, `💰 Bukti pembayaran baru dari [${from.first_name}](tg://user?id=${userId})\nKode: \`${code}\`\nGunakan /approve ${userId} atau /reject ${userId}.`, "Markdown");
-      }
-      return;
-    }
-
-    // User kirim kode lisensi
-    if (/^LS-[A-Z0-9-]+$/i.test(text)) {
-      const lic = globalThis.DB.LICENSES[userId];
-      if (lic && lic.code === text) {
-        await sendMessage(chatId, `✅ Lisensi aktif hingga ${formatDate(lic.exp)}.`);
-      } else {
-        await sendMessage(chatId, `❌ Kode tidak valid atau belum disetujui.`);
+        await sendMessage(adminId,
+          `💰 Bukti pembayaran dari [${name}](tg://user?id=${userId})\nKode: \`${code}\`\nGunakan /approve ${userId} atau /reject ${userId}.`, "Markdown");
       }
       return;
     }
@@ -99,24 +68,15 @@ async function handleMessage(msg) {
     // Admin commands
     if (text.startsWith("/")) {
       const [cmd, arg] = text.split(" ");
-      if (!isAdmin) {
-        await sendMessage(chatId, "❌ Kamu bukan admin!");
-        return;
-      }
+      if (!isAdmin) return sendMessage(chatId, "❌ Kamu bukan admin!");
 
       switch (cmd) {
-        case "/pending":
-          return sendPending(chatId);
-        case "/approve":
-          return approveLicense(chatId, parseInt(arg));
-        case "/reject":
-          return rejectLicense(chatId, parseInt(arg));
-        case "/licenses":
-          return listLicenses(chatId);
-        default:
-          await sendMessage(chatId, "📘 Perintah admin:\n/pending\n/approve <id>\n/reject <id>\n/licenses");
+        case "/pending": return listPending(chatId, env);
+        case "/approve": return approve(chatId, env, parseInt(arg));
+        case "/reject": return reject(chatId, env, parseInt(arg));
+        case "/licenses": return listLicenses(chatId, env);
+        default: await sendMessage(chatId, "📘 Perintah admin:\n/pending\n/approve <id>\n/reject <id>\n/licenses");
       }
-      return;
     }
   }
 
@@ -126,57 +86,57 @@ async function handleMessage(msg) {
       if (member.is_bot) continue;
       const photoCount = await getPhotos(member.id);
       await sendMessage(chatId, `👋 ${member.first_name} bergabung.\nFoto profil: ${photoCount}`);
-      if (photoCount === 0) {
-        await sendMessage(chatId, `⚠️ ${member.first_name} belum punya foto profil.`);
-      }
+      if (photoCount === 0) await sendMessage(chatId, `⚠️ ${member.first_name} belum punya foto profil.`);
     }
   }
 }
 
-// === ADMIN HELPERS ===
-async function sendPending(chatId) {
-  const pend = Object.values(globalThis.DB.PENDING);
-  if (pend.length === 0) return sendMessage(chatId, "Tidak ada pembayaran pending.");
+// === FUNCTIONS ===
+async function listPending(chatId, env) {
+  const list = await env.DB.list({ prefix: "pending:" });
+  if (list.keys.length === 0) return sendMessage(chatId, "Tidak ada pembayaran pending.");
   let msg = "📋 Pending pembayaran:\n";
-  for (const p of pend) {
+  for (const k of list.keys) {
+    const p = JSON.parse(await env.DB.get(k.name));
     msg += `User ${p.username || p.userId} — kode ${p.code}\n`;
   }
   await sendMessage(chatId, msg);
 }
 
-async function approveLicense(chatId, userId) {
-  const pend = globalThis.DB.PENDING[userId];
-  if (!pend) return sendMessage(chatId, "User tidak ada di daftar pending.");
+async function approve(chatId, env, userId) {
+  const key = `pending:${userId}`;
+  const data = await env.DB.get(key);
+  if (!data) return sendMessage(chatId, "User tidak ada di daftar pending.");
+  const p = JSON.parse(data);
   const exp = Date.now() + LICENSE_DAYS * DAY_MS;
-  globalThis.DB.LICENSES[userId] = { code: pend.code, exp };
-  delete globalThis.DB.PENDING[userId];
+  await env.DB.put(`license:${userId}`, JSON.stringify({ code: p.code, exp }));
+  await env.DB.delete(key);
   await sendMessage(chatId, `✅ Lisensi disetujui untuk ${userId}.`);
-  await sendMessage(userId, `✅ Lisensi kamu disetujui!\nKode: \`${pend.code}\`\nAktif hingga ${formatDate(exp)}.`, "Markdown");
+  await sendMessage(userId, `✅ Lisensi kamu disetujui!\nKode: \`${p.code}\`\nAktif hingga ${formatDate(exp)}.`, "Markdown");
 }
 
-async function rejectLicense(chatId, userId) {
-  const pend = globalThis.DB.PENDING[userId];
-  if (!pend) return sendMessage(chatId, "User tidak ada di pending.");
-  delete globalThis.DB.PENDING[userId];
+async function reject(chatId, env, userId) {
+  const key = `pending:${userId}`;
+  const data = await env.DB.get(key);
+  if (!data) return sendMessage(chatId, "User tidak ada di daftar pending.");
+  await env.DB.delete(key);
   await sendMessage(chatId, `❌ Pembayaran user ${userId} ditolak.`);
   await sendMessage(userId, `❌ Pembayaran kamu ditolak. Silakan hubungi admin.`);
 }
 
-async function listLicenses(chatId) {
-  const list = Object.entries(globalThis.DB.LICENSES);
-  if (list.length === 0) return sendMessage(chatId, "Belum ada lisensi aktif.");
+async function listLicenses(chatId, env) {
+  const list = await env.DB.list({ prefix: "license:" });
+  if (list.keys.length === 0) return sendMessage(chatId, "Belum ada lisensi aktif.");
   let msg = "💼 Lisensi aktif:\n";
-  for (const [id, L] of list) {
-    msg += `User ${id} — exp: ${formatDate(L.exp)}\n`;
+  for (const k of list.keys) {
+    const L = JSON.parse(await env.DB.get(k.name));
+    const uid = k.name.replace("license:", "");
+    msg += `User ${uid} — exp: ${formatDate(L.exp)}\n`;
   }
   await sendMessage(chatId, msg);
 }
 
-// === UTIL ===
-function genCode() {
-  return `LS-${Math.random().toString(36).substring(2, 8).toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`;
-}
-
+// === UTILITIES ===
 async function sendMessage(chatId, text, mode = "HTML") {
   await fetch(`${API}/sendMessage`, {
     method: "POST",
@@ -203,12 +163,9 @@ async function getPhotos(userId) {
   }
 }
 
-async function safeSend(chatId, text) {
-  try {
-    await sendMessage(chatId, text);
-  } catch {}
+function genCode() {
+  return `LS-${Math.random().toString(36).substring(2, 8).toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`;
 }
-
 function formatDate(ts) {
   return new Date(ts).toLocaleString("id-ID");
-    }
+      }
