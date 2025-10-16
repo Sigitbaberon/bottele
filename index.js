@@ -1,40 +1,403 @@
-// bot-satpam-pro.js
-// Cloudflare Worker (module) - advanced satpam bot
-// Bindings: none required. If you use Wrangler, set secret "BOT_TOKEN" to your bot token.
-// If env.BOT_TOKEN not set, it will fallback to hardcoded TOKEN below (not recommended).
+// bot-licensed-satpam-30d.js
+// Cloudflare Worker - Satpam Bot berlisensi (30-day subscription)
+// NOTE: No KV. All storage is in-memory (globalThis). Will be lost on restart/redeploy.
+// Recommended: set BOT_TOKEN and ADMIN_ID as secrets in Wrangler (env.BOT_TOKEN, env.ADMIN_ID).
 
-const FALLBACK_TOKEN = "7522192709:AAFDwX-Lng-_3FUtr6oAiFu-nfD_XLMCsd8"; // Prefer env secret instead
-const ADMIN_ID = 7729648778; // Chat ID where bot logs (private chat or admin group). Ganti jika perlu.
-
-const DEFAULTS = {
-  WARN_LIMIT: 3,
-  SOFT_MODE: true, // jika true -> hanya peringatan; jika false -> auto-kick di limit
-  FLOOD_COUNT: 5,
-  FLOOD_WINDOW_SEC: 10,
-  REPEAT_THRESHOLD: 3, // berapa kali mengulang pesan yang sama untuk warn
-  ALLOW_LINKS: false, // default blok link kecuali domain whitelist
-  ALLOWED_DOMAINS: ["t.me/yourgroup", "yourdomain.com"], // contoh
-  BLOCK_MEDIA_TYPES: { video: false, sticker: false, gif: false, document: false }, // atur sesuai kebutuhan
-  TEMP_MUTE_SECONDS: 60 * 5,
-};
+const FALLBACK_TOKEN = "7522192709:AAFDwX-Lng-_3FUtr6oAiFu-nfD_XLMCsd8"; // fallback only (not recommended)
+const FALLBACK_ADMIN = 7729648778; // fallback admin id if env not set
+const QRIS_LINK = "https://raw.githubusercontent.com/Sigitbaberon/qris/refs/heads/main/qr_ID1025423347687_29.09.25_175910930_1759109315016.jpeg";
+const LICENSE_VALID_DAYS = 30;
+const MS_IN_DAY = 24 * 3600 * 1000;
 
 export default {
   async fetch(request, env) {
     const TOKEN = env && env.BOT_TOKEN ? env.BOT_TOKEN : FALLBACK_TOKEN;
+    const ADMIN_ID = env && env.ADMIN_ID ? parseInt(env.ADMIN_ID) : FALLBACK_ADMIN;
     const API = `https://api.telegram.org/bot${TOKEN}`;
 
-    // initialize global storage (in-memory)
-    if (!globalThis.SAT) {
-      globalThis.SAT = {
-        warns: {},           // key: chatId:userId -> {count, last}
-        messageCounts: {},   // key: chatId:userId -> [{ts, text}, ...] used for flood and repeat detection
-        mutes: {},           // key: chatId:userId -> until_ts
-        whitelist: {},       // key: chatId:userId -> true
-        blacklist: {},       // key: chatId:userId -> true
-        chatSettings: {},    // key: chatId -> overrides of DEFAULTS
+    // init in-memory stores
+    if (!globalThis.LIC) {
+      globalThis.LIC = {
+        PENDING: {},   // userId -> { userId, username, ts, mediaFileId, code }
+        LICENSES: {},  // userId -> { code, activeUntil: ts, groups: [chatId...] }
+        GROUPS: {},    // chatId -> { ownerUserId }
+        SETTINGS: {},  // chatId -> per-group settings
+        LOGS: [],      // array of recent logs (in-memory)
       };
     }
 
+    try {
+      if (request.method === "POST") {
+        const update = await request.json();
+        if (update.message) return await handleMessage(update.message, API, ADMIN_ID);
+        if (update.callback_query) return new Response("No callbacks handled");
+        return new Response("unsupported update");
+      } else {
+        return new Response("Bot Licenced Satpam (30-day) aktif ✅");
+      }
+    } catch (e) {
+      // log error to admin
+      await safeSend(API, ADMIN_ID, `❗Bot error: ${e.message}\n${e.stack || ""}`);
+      return new Response("error", { status: 500 });
+    }
+  },
+};
+
+// ------------------ HANDLER ------------------
+async function handleMessage(msg, API, ADMIN_ID) {
+  const chatId = msg.chat.id;
+  const isPrivate = (msg.chat.type === "private");
+  const from = msg.from || {};
+  const userId = from.id;
+  const text = (msg.text || "").trim();
+
+  // === PRIVATE CHAT FLOW: /start, payment, upload proof, manage license ===
+  if (isPrivate) {
+    // /start -> show QRIS and instructions
+    if (text === "/start" || text === "/help") {
+      const welcome = `Halo ${from.first_name || ""} 👋\n` +
+        `Untuk menggunakan bot Satpam ini di grupmu, diperlukan lisensi ${LICENSE_VALID_DAYS} hari.\n` +
+        `Silakan bayar lewat QRIS berikut, lalu kirim bukti transfer (foto) di chat ini.\n\n` +
+        `🔗 Link QRIS: ${QRIS_LINK}\n\n` +
+        `Setelah mengirim bukti, tunggu admin memverifikasi. Kamu akan mendapat kode lisensi jika disetujui.`;
+      await sendMessage(API, chatId, welcome);
+      // also show the image (QR)
+      await sendPhoto(API, chatId, QRIS_LINK, "QRIS - bayar disini");
+      return new Response("ok");
+    }
+
+    // User uploads photo (assume it's proof of payment)
+    // Telegram sends photos in msg.photo as array (sizes). We'll store file_id of largest.
+    if (msg.photo && Array.isArray(msg.photo) && msg.photo.length > 0) {
+      const largest = msg.photo[msg.photo.length - 1];
+      // create pending entry
+      const code = generateLicenseCode();
+      globalThis.LIC.PENDING[userId] = {
+        userId,
+        username: from.username || null,
+        ts: Date.now(),
+        mediaFileId: largest.file_id,
+        code,
+      };
+      // notify user
+      await sendMessage(API, chatId, `✅ Bukti diterima. Kode verifikasi sementara: <code>${code}</code>\nTunggu verifikasi admin.`);
+      // notify admin with approve/reject instructions
+      await sendMessage(API, ADMIN_ID,
+        `🔔 Pembayaran masuk dari ${from.username ? "@" + from.username : from.first_name + " ("+userId+")"}.\n` +
+        `User ID: ${userId}\nKode verifikasi: ${code}\nGunakan perintah:\n` +
+        `/approve ${userId}\n` +
+        `/reject ${userId}\n` +
+        `Lihat bukti: gunakan /getproof ${userId}`);
+      // store brief log
+      pushLog(`Pending payment from ${userId} (code ${code})`);
+      return new Response("ok");
+    }
+
+    // If user sends code to activate (they may paste code)
+    if (/^LS-[A-Z0-9\-]+$/i.test(text)) {
+      const given = text.trim().toUpperCase();
+      // find pending or license with same code
+      const pending = Object.values(globalThis.LIC.PENDING).find(p => p.code === given);
+      if (pending && pending.userId === userId) {
+        // not yet approved by admin — inform user to wait
+        await sendMessage(API, chatId, `Kode ${given} terdaftar tetapi menunggu verifikasi admin. Silakan tunggu.`);
+        return new Response("ok");
+      }
+      // maybe admin already approved and assigned license with same code
+      const licEntry = Object.entries(globalThis.LIC.LICENSES).find(([uid, L]) => L.code === given);
+      if (licEntry) {
+        const [ownerId, L] = licEntry;
+        if (parseInt(ownerId) === userId) {
+          await sendMessage(API, chatId, `✅ Lisensi valid. Aktif sampai: ${new Date(L.activeUntil).toLocaleString()}`);
+          return new Response("ok");
+        } else {
+          await sendMessage(API, chatId, `❌ Kode lisensi bukan milik akunmu.`);
+          return new Response("ok");
+        }
+      }
+      await sendMessage(API, chatId, `❌ Kode tidak ditemukan. Pastikan kamu mengirim kode yang benar.`);
+      return new Response("ok");
+    }
+
+    // Commands usable by licensed users in private chat
+    // /addgroup -> user wants to register a group (bot must be admin in that group)
+    if (text.startsWith("/addgroup")) {
+      // format: /addgroup <chat_id>  OR instruct user to forward a message from that group to this bot (then we can get chat id)
+      const parts = text.split(/\s+/);
+      if (parts.length < 2) {
+        await sendMessage(API, chatId, `Gunakan: /addgroup <chat_id>\nAtau forward pesan dari grup ke chat ini agar bot bisa membaca chat_id.`);
+        return new Response("ok");
+      }
+      const targetChatId = parseInt(parts[1]);
+      if (!targetChatId) {
+        await sendMessage(API, chatId, `ID grup tidak valid.`);
+        return new Response("ok");
+      }
+      // check license
+      const lic = globalThis.LIC.LICENSES[userId];
+      if (!lic || lic.activeUntil < Date.now()) {
+        await sendMessage(API, chatId, `❌ Lisensimu tidak aktif. Silakan bayar/perpanjang.`);
+        return new Response("ok");
+      }
+      // register group under this owner
+      globalThis.LIC.GROUPS[targetChatId] = { ownerUserId: userId };
+      // also record in license groups
+      lic.groups = lic.groups || [];
+      if (!lic.groups.includes(targetChatId)) lic.groups.push(targetChatId);
+      await sendMessage(API, chatId, `✅ Grup ${targetChatId} didaftarkan. Pastikan bot sudah admin di grup tersebut.`);
+      await sendMessage(API, ADMIN_ID, `ℹ️ ${formatUserSimple(from)} menambahkan grup ${targetChatId} ke lisensinya.`);
+      return new Response("ok");
+    }
+
+    // /status -> show license status
+    if (text === "/status") {
+      const lic = globalThis.LIC.LICENSES[userId];
+      if (!lic) return await sendMessage(API, chatId, `Kamu belum punya lisensi aktif.`);
+      await sendMessage(API, chatId, `Lisensi: ${lic.code}\nAktif sampai: ${new Date(lic.activeUntil).toLocaleString()}\nGrup terdaftar: ${lic.groups ? lic.groups.join(", ") : "(tidak ada)"}`);
+      return new Response("ok");
+    }
+
+    // /renew -> show QRIS again
+    if (text === "/renew") {
+      await sendMessage(API, chatId, `Untuk perpanjangan lisensi (${LICENSE_VALID_DAYS} hari), silakan bayar lewat QRIS berikut dan kirim bukti:`);
+      await sendPhoto(API, chatId, QRIS_LINK, "QRIS perpanjangan");
+      return new Response("ok");
+    }
+
+    // other private commands for admins (you)
+    if (text.startsWith("/")) {
+      const parts = text.split(/\s+/);
+      const cmd = parts[0].toLowerCase();
+
+      // Admin-only commands (must be ADMIN_ID user)
+      if (userId !== ADMIN_ID) {
+        // non-admin users other commands handled above; otherwise unauthorized
+        // allow small help fallback
+        if (cmd === "/help" || cmd === "/commands") {
+          await sendMessage(API, chatId, "Perintah private: /start, kirim foto bukti transfer, /status, /addgroup <chat_id>, /renew");
+          return new Response("ok");
+        }
+        return new Response("ok");
+      }
+
+      // === Admin actions ===
+      if (cmd === "/pending") {
+        const pend = Object.values(globalThis.LIC.PENDING);
+        if (pend.length === 0) return await sendMessage(API, chatId, "Tidak ada pembayaran pending.");
+        let msg = "Pending payments:\n";
+        for (const p of pend) {
+          msg += `User ${p.username? "@"+p.username : p.userId} (id: ${p.userId}) code:${p.code} ts:${new Date(p.ts).toLocaleString()}\n`;
+        }
+        msg += "\nGunakan /getproof <user_id> untuk lihat bukti, /approve <user_id> atau /reject <user_id>";
+        await sendMessage(API, chatId, msg);
+        return new Response("ok");
+      }
+
+      if (cmd === "/getproof") {
+        const target = parseInt(parts[1]);
+        if (!target) return await sendMessage(API, chatId, "Gunakan: /getproof <user_id>");
+        const p = globalThis.LIC.PENDING[target];
+        if (!p) return await sendMessage(API, chatId, "Tidak ada bukti untuk user ini.");
+        // send the stored file_id (photo)
+        await sendPhotoByFileId(API, chatId, p.mediaFileId, `Bukti pembayaran dari ${p.username? "@"+p.username : p.userId} (code ${p.code})`);
+        return new Response("ok");
+      }
+
+      if (cmd === "/approve") {
+        const target = parseInt(parts[1]);
+        if (!target) return await sendMessage(API, chatId, "Gunakan: /approve <user_id>");
+        const p = globalThis.LIC.PENDING[target];
+        if (!p) return await sendMessage(API, chatId, "Tidak ada pending untuk user ini.");
+        // create license valid for LICENSE_VALID_DAYS from now
+        const activeUntil = Date.now() + LICENSE_VALID_DAYS * MS_IN_DAY;
+        globalThis.LIC.LICENSES[target] = { code: p.code, activeUntil, groups: [] };
+        delete globalThis.LIC.PENDING[target];
+        // notify user
+        await sendMessage(API, target, `✅ Lisensimu disetujui oleh admin.\nKode lisensi: <code>${p.code}</code>\nLisensi aktif sampai: ${new Date(activeUntil).toLocaleString()}\nKirim /addgroup <chat_id> di private chat ini untuk mendaftarkan grup-mu.`);
+        await sendMessage(API, chatId, `✅ Approved user ${target} (code ${p.code})`);
+        pushLog(`Approved license for ${target} code ${p.code}`);
+        return new Response("ok");
+      }
+
+      if (cmd === "/reject") {
+        const target = parseInt(parts[1]);
+        if (!target) return await sendMessage(API, chatId, "Gunakan: /reject <user_id>");
+        const p = globalThis.LIC.PENDING[target];
+        if (!p) return await sendMessage(API, chatId, "Tidak ada pending untuk user ini.");
+        // notify user and remove pending
+        delete globalThis.LIC.PENDING[target];
+        await sendMessage(API, target, `❌ Maaf, bukti pembayaran kamu ditolak oleh admin. Silakan hubungi admin atau kirim bukti lagi.`);
+        await sendMessage(API, chatId, `✅ Rejected user ${target}`);
+        pushLog(`Rejected payment for ${target}`);
+        return new Response("ok");
+      }
+
+      if (cmd === "/licenses") {
+        const rows = Object.entries(globalThis.LIC.LICENSES).map(([uid, L]) => {
+          return `User ${uid}: code ${L.code}, until ${new Date(L.activeUntil).toLocaleString()}, groups:${L.groups?L.groups.join(","):"-"}`;
+        });
+        await sendMessage(API, chatId, rows.length ? rows.join("\n") : "Tidak ada license aktif.");
+        return new Response("ok");
+      }
+
+      if (cmd === "/revoke") {
+        const target = parseInt(parts[1]);
+        if (!target) return await sendMessage(API, chatId, "Gunakan: /revoke <user_id>");
+        if (globalThis.LIC.LICENSES[target]) {
+          delete globalThis.LIC.LICENSES[target];
+          await sendMessage(API, chatId, `✅ Lisensi untuk ${target} dicabut.`);
+          await sendMessage(API, target, `⚠️ Lisensimu telah dicabut oleh admin.`);
+          pushLog(`Revoked license for ${target}`);
+        } else {
+          await sendMessage(API, chatId, `User ini tidak punya lisensi.`);
+        }
+        return new Response("ok");
+      }
+
+      // other admin commands can be added...
+      return new Response("ok");
+    }
+  } // end private chat handler
+
+  // === GROUP CHAT FLOW: Bot acts as satpam only for registered groups ===
+  // Check if group is registered and owned by licensed user
+  const groupReg = globalThis.LIC.GROUPS[chatId];
+  if (!groupReg) {
+    // group not registered — ignore (unless admin commands in group)
+    // still allow admins to use /activate maybe
+    if (text && text.startsWith("/activate")) {
+      // /activate <license_code> used in group by owner to link group quickly
+      const parts = text.split(/\s+/);
+      const code = parts[1];
+      if (!code) { await sendMessage(API, chatId, "Gunakan: /activate <kode_lisensi> (di private chat lebih aman)"); return new Response("ok"); }
+      // find license by code
+      const licEntry = Object.entries(globalThis.LIC.LICENSES).find(([uid, L]) => L.code === code);
+      if (!licEntry) { await sendMessage(API, chatId, "Kode lisensi tidak ditemukan atau tidak aktif."); return new Response("ok"); }
+      const [ownerId, L] = licEntry;
+      // ensure the person invoking command is owner or admin
+      // we can't be sure who invoked in group unless command includes reply or user is admin; simplest: require that the command is sent by the owner user (by id)
+      // but Telegram exposes msg.from — require msg.from.id === ownerId OR msg.from is admin
+      if (msg.from && (msg.from.id === parseInt(ownerId) || await isAdmin(API, chatId, msg.from.id))) {
+        // link group
+        globalThis.LIC.GROUPS[chatId] = { ownerUserId: parseInt(ownerId) };
+        L.groups = L.groups || [];
+        if (!L.groups.includes(chatId)) L.groups.push(chatId);
+        await sendMessage(API, chatId, `✅ Bot sudah aktif di grup ini atas lisensi ${L.code}.`);
+        await sendMessage(API, ADMIN_ID, `ℹ️ Group ${chatId} activated with license ${L.code} (owner ${ownerId})`);
+        pushLog(`Group ${chatId} activated by ${msg.from.id} with license ${L.code}`);
+      } else {
+        await sendMessage(API, chatId, `Hanya pemilik lisensi atau admin grup yang dapat mengaktifkan.`);
+      }
+      return new Response("ok");
+    }
+
+    return new Response("no action"); // ignore non-registered groups
+  }
+
+  // If group is registered: run satpam features (use previous advanced logic or minimal)
+  // For simplicity here, we will do: on new_chat_members -> run profile summary and warn logic (similar to previous)
+  if (msg.new_chat_members && Array.isArray(msg.new_chat_members)) {
+    for (const member of msg.new_chat_members) {
+      if (member.is_bot) continue;
+      // owner who added?
+      const adder = msg.from || null;
+      if (adder && await isAdmin(API, chatId, adder.id)) {
+        await sendMessage(API, chatId, `✅ ${formatUserSimple(member)} ditambahkan oleh admin ${formatUserSimple(adder)}.`);
+        await sendMessage(API, getAdminId(), `ℹ️ ${formatUserSimple(member)} added to group ${chatId} by admin ${formatUserSimple(adder)}.`);
+        continue;
+      }
+      // check photo
+      const photos = await (await fetch(`${API}/getUserProfilePhotos?user_id=${member.id}&limit=1`)).json();
+      const photoCount = photos.ok ? photos.result.total_count || 0 : 0;
+      let info = `👋 Profil baru: ${formatUserSimple(member)}\nFoto profil: ${photoCount}`;
+      await sendMessage(API, chatId, info);
+      if (photoCount === 0) {
+        // warn logic (in-memory)
+        const key = `${chatId}:${member.id}`;
+        globalThis.LIC.PENDING_WARN = globalThis.LIC.PENDING_WARN || {};
+        globalThis.LIC.PENDING_WARN[key] = (globalThis.LIC.PENDING_WARN[key] || 0) + 1;
+        const w = globalThis.LIC.PENDING_WARN[key];
+        await sendMessage(API, chatId, `⚠️ ${formatUserSimple(member)} belum punya foto. Peringatan ${w}/3`);
+        await sendMessage(API, ADMIN_ID, `⚠️ ${formatUserSimple(member)} join ${chatId} no photo (warn ${w}/3)`);
+        if (w >= 3) {
+          // kick
+          await fetch(`${API}/kickChatMember`, { method: "POST", headers:{ "content-type":"application/json"}, body: JSON.stringify({ chat_id: chatId, user_id: member.id })});
+          await sendMessage(API, chatId, `🚫 ${formatUserSimple(member)} dikeluarkan (3 warnings).`);
+          delete globalThis.LIC.PENDING_WARN[key];
+        }
+      }
+    }
+    return new Response("ok");
+  }
+
+  return new Response("no action");
+}
+
+// ------------------ UTILITIES ------------------
+
+function generateLicenseCode() {
+  const a = () => Math.random().toString(36).substring(2, 8).toUpperCase();
+  return `LS-${a()}-${Math.floor(1000 + Math.random()*9000)}`;
+}
+
+async function sendMessage(API, chatId, text, parse_mode="HTML") {
+  try {
+    await fetch(`${API}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode, disable_web_page_preview: true }),
+    });
+  } catch (e) {
+    console.error("sendMessage error", e);
+  }
+}
+
+async function sendPhoto(API, chatId, url, caption="") {
+  try {
+    await fetch(`${API}/sendPhoto`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, photo: url, caption }),
+    });
+  } catch (e) {
+    console.error("sendPhoto error", e);
+  }
+}
+
+async function sendPhotoByFileId(API, chatId, fileId, caption="") {
+  try {
+    await fetch(`${API}/sendPhoto`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, photo: fileId, caption }),
+    });
+  } catch (e) {
+    console.error("sendPhotoByFileId error", e);
+  }
+}
+
+function pushLog(s) {
+  globalThis.LIC.LOGS = globalThis.LIC.LOGS || [];
+  globalThis.LIC.LOGS.push({ ts: Date.now(), text: s });
+  // keep last 200 logs
+  if (globalThis.LIC.LOGS.length > 200) globalThis.LIC.LOGS.shift();
+}
+
+function formatUserSimple(u) {
+  return u.username ? `@${u.username} (${u.id})` : `${u.first_name || "(no name)"} (${u.id})`;
+}
+
+async function isAdmin(API, chatId, userId) {
+  try {
+    const res = await (await fetch(`${API}/getChatMember?chat_id=${chatId}&user_id=${userId}`)).json();
+    return res.ok && (res.result.status === "creator" || res.result.status === "administrator");
+  } catch { return false; }
+}
+
+function getAdminId() {
+  // used in some places
+  return (typeof FALLBACK_ADMIN !== "undefined") ? FALLBACK_ADMIN : null;
+    }
     try {
       if (request.method === "POST") {
         const update = await request.json();
