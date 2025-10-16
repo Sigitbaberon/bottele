@@ -1,5 +1,7 @@
-{
-  "name": "bot-satpam-sakti",
-  "main": "index.js",
-  "compatibility_date": "2025-10-16"
-}
+name = "bottele"
+main = "index.js"
+compatibility_date = "2025-10-16"
+
+kv_namespaces = [
+  { binding = "DB", id = "236d68b5c6964ee79fc7f0afbda2340e" }
+]
