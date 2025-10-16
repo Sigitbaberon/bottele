@@ -1,300 +1,493 @@
-/** Cloudflare Worker — Slot Machine PRO (All-in-one single file)
+// Cloudflare Worker (Module) - Slot Game Pragmatic-style (Demo)
+// Save as `index.js` in a Worker (module type).
+// - GET /  -> serves HTML game
+// - POST /spin -> returns JSON { reels: [...], rows: 3, payoutMultiplier, winAmount, debug }
+// Deploy: Cloudflare Workers (module)
 
-Features included:
+const SYMBOLS = [
+  { id: "diamond", label: "Diamond", weight: 2, multiplier: 500 },
+  { id: "seven", label: "7", weight: 6, multiplier: 200 },
+  { id: "star", label: "Star", weight: 10, multiplier: 100 },
+  { id: "bell", label: "Bell", weight: 14, multiplier: 60 },
+  { id: "lemon", label: "Lemon", weight: 22, multiplier: 30 },
+  { id: "cherry", label: "Cherry", weight: 46, multiplier: 10 }
+];
+// total weight = sum weights -> used by weighted RNG
+const TOTAL_WEIGHT = SYMBOLS.reduce((s, x) => s + x.weight, 0);
 
-Modern responsive UI (HTML/CSS/JS) with animations, accessible controls, sounds (optional)
+// Configurable RTP-ish control (for demo): average payout fraction (0.92 -> house edge 8%)
+// NOTE: This simple demo doesn't guarantee exact RTP; for production use a validated payout engine.
+const TARGET_PAYOUT_RATE = 0.92;
 
-Server-side authoritative game logic and RNG using Web Crypto
+addEventListener("fetch", (event) => {
+  event.respondWith(handleRequest(event.request));
+});
 
-Persistent player accounts & balances stored in Cloudflare KV (binding: SLOT_KV)
+async function handleRequest(req) {
+  const url = new URL(req.url);
+  if (req.method === "POST" && url.pathname === "/spin") {
+    try {
+      const body = await req.json().catch(() => ({}));
+      // Expected: { bet: number, clientSeed?: string, turbo?: bool }
+      const bet = Math.max(1, Math.floor(Number(body.bet) || 1));
+      // Use server RNG (crypto)
+      const spinResult = serverSpin(bet);
+      return jsonResponse(spinResult);
+    } catch (err) {
+      return jsonResponse({ error: "invalid_request", message: String(err) }, 400);
+    }
+  }
 
-Signed session cookie (HMAC-SHA256) using secret binding SECRET_KEY
+  // Serve HTML + inline assets for any other GET
+  if (req.method === "GET") {
+    return new Response(HTML_PAGE, {
+      headers: { "Content-Type": "text/html; charset=utf-8" },
+    });
+  }
 
-Leaderboard stored in KV (top 50)
-
-Audit-ready spin receipts (hash) that can be revealed for fairness
-
-Admin endpoints: /api/reset-user, /api/admin/stats (protected by admin token)
-
-Rate limiting (basic per-user cooldown) and input validation
-
-
-Deployment requirements (must configure before publish):
-
-SECRET_KEY: secret binding (wrangler secret put SECRET_KEY)
-
-SLOT_KV: KV namespace binding (put binding name SLOT_KV in wrangler/config or Dashboard)
-
-(Optional) ADMIN_TOKEN: secret binding for admin operations
-
-
-Endpoints:
-
-GET  /            -> game UI
-
-POST /api/register -> { nickname } -> creates user, sets session cookie
-
-POST /api/spin    -> { bet } -> performs spin, updates balance, returns result
-
-GET  /api/balance -> returns current user balance
-
-GET  /api/leaderboard -> returns top leaderboard entries
-
-POST /api/reset-user -> reset user's balance to default (dev)
-
-GET  /api/admin/stats -> admin-only stats
-
-
-Notes: This file is intended to be deployed as a Worker with KV binding SLOT_KV and a secret SECRET_KEY.
-
-*/
-
-// ---------------------- Configuration ---------------------- const DEFAULT_BALANCE = 1000; const MAX_LEADERBOARD = 50; const SESSION_COOKIE = 'slot_sess'; const COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
-
-// Payouts and symbol weights const SYMBOLS = [ { sym: '🍒', weight: 30, mul: 2 }, { sym: '🍋', weight: 25, mul: 3 }, { sym: '🔔', weight: 20, mul: 10 }, { sym: '⭐', weight: 15, mul: 25 }, { sym: '💎', weight: 10, mul: 100 } ];
-
-// ---------------------- Utilities ---------------------- async function secureRandomInt(max) { const array = new Uint32Array(1); crypto.getRandomValues(array); const range = 0xFFFFFFFF + 1; const limit = Math.floor(range / max) * max; let r = array[0]; while (r >= limit) { crypto.getRandomValues(array); r = array[0]; } return r % max; }
-
-async function importHmacKey(secret) { return await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']); }
-
-async function signValue(key, data) { const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(data)); return btoa(String.fromCharCode(...new Uint8Array(sig))).replace(/+/g, '-').replace(///g, '_').replace(/=+$/, ''); }
-
-async function verifySignature(key, data, sigB64) { try { const expected = await signValue(key, data); return expected === sigB64; } catch (e) { return false; } }
-
-function parseCookies(request) { const header = request.headers.get('Cookie') || ''; const obj = {}; header.split(';').forEach(part => { const [k, v] = part.split('=').map(s => s && s.trim()); if (k && v) obj[k] = v; }); return obj; }
-
-function makeCookieHeader(name, value, opts = {}) { let cookie = ${name}=${value}; if (opts.httpOnly) cookie += '; HttpOnly'; if (opts.path) cookie += ; Path=${opts.path}; if (opts.maxAge) cookie += ; Max-Age=${opts.maxAge}; if (opts.sameSite) cookie += ; SameSite=${opts.sameSite}; return cookie; }
-
-function jsonResponse(obj, status = 200, extraHeaders = {}) { return new Response(JSON.stringify(obj), { status, headers: Object.assign({ 'content-type': 'application/json;charset=utf-8' }, extraHeaders) }); }
-
-function htmlResponse(html) { return new Response(html, { headers: { 'content-type': 'text/html;charset=utf-8' } }); }
-
-function uuidv4() { // lightweight client-side UUID return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g, c => (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)); }
-
-// ---------------------- KV Helpers ---------------------- async function kvGet(env, key) { return await env.SLOT_KV.get(key, { type: 'json' }); } async function kvPut(env, key, value) { return await env.SLOT_KV.put(key, JSON.stringify(value)); }
-
-// get user object by id async function getUser(env, userId) { if (!userId) return null; const u = await env.SLOT_KV.get(user:${userId}, { type: 'json' }); return u; }
-
-// create / update leaderboard (simple sorted array stored in 'leaderboard') async function updateLeaderboard(env, user) { // user: { id, nickname, balance } const key = 'leaderboard'; let board = await env.SLOT_KV.get(key, { type: 'json' }); if (!Array.isArray(board)) board = []; const existingIdx = board.findIndex(x => x.id === user.id); if (existingIdx !== -1) board.splice(existingIdx, 1); board.push({ id: user.id, nickname: user.nickname, balance: user.balance, updated: Date.now() }); board.sort((a, b) => b.balance - a.balance || a.updated - b.updated); if (board.length > MAX_LEADERBOARD) board = board.slice(0, MAX_LEADERBOARD); await env.SLOT_KV.put(key, JSON.stringify(board)); }
-
-async function getLeaderboard(env) { const board = await env.SLOT_KV.get('leaderboard', { type: 'json' }); return Array.isArray(board) ? board : []; }
-
-// ---------------------- Session / Auth ---------------------- async function createSession(env, userId) { const payload = JSON.stringify({ userId, ts: Date.now() }); const key = await importHmacKey(env.SECRET_KEY || 'dev_secret'); const sig = await signValue(key, btoa(payload)); const cookieVal = ${btoa(payload)}.${sig}; const cookie = makeCookieHeader(SESSION_COOKIE, cookieVal, { httpOnly: true, path: '/', maxAge: COOKIE_MAX_AGE, sameSite: 'Lax' }); return cookie; }
-
-async function parseSession(request, env) { const cookies = parseCookies(request); const val = cookies[SESSION_COOKIE]; if (!val) return null; const [data, sig] = val.split('.'); if (!data || !sig) return null; const key = await importHmacKey(env.SECRET_KEY || 'dev_secret'); const ok = await verifySignature(key, data, sig); if (!ok) return null; try { const parsed = JSON.parse(atob(data)); return parsed.userId; } catch (e) { return null; } }
-
-// ---------------------- Game Logic ---------------------- async function pickSymbolIndex() { const total = SYMBOLS.reduce((s, x) => s + x.weight, 0); const rnd = await secureRandomInt(total); let acc = 0; for (let i = 0; i < SYMBOLS.length; i++) { acc += SYMBOLS[i].weight; if (rnd < acc) return i; } return SYMBOLS.length - 1; }
-
-async function spinOnce() { const i0 = await pickSymbolIndex(); const i1 = await pickSymbolIndex(); const i2 = await pickSymbolIndex(); const reels = [SYMBOLS[i0].sym, SYMBOLS[i1].sym, SYMBOLS[i2].sym]; let winMul = 0; if (i0 === i1 && i1 === i2) { if (SYMBOLS[i0].sym === '💎') { const rr = await secureRandomInt(1000); winMul = rr === 0 ? 1000 : SYMBOLS[i0].mul; } else { winMul = SYMBOLS[i0].mul; } } // simple near-miss bonus (optional): if two same -> small partial win if (!winMul && (i0 === i1 || i1 === i2 || i0 === i2)) { winMul = 0.2; // 20% of bet back as consolation } return { reels, winMul }; }
-
-// ---------------------- Handlers ---------------------- addEventListener('fetch', event => { event.respondWith(router(event.request, event)); });
-
-async function router(request, event) { const url = new URL(request.url); const pathname = url.pathname; const env = event?.env || (typeof SECRET_KEY !== 'undefined' ? { SECRET_KEY } : {});
-
-// static UI if (request.method === 'GET' && pathname === '/') { // try to read session for personalized UI const userId = await parseSession(request, env); let user = null; if (userId) user = await getUser(env, userId); const html = renderHTML(user ? user.nickname : null, user ? user.balance : DEFAULT_BALANCE); return htmlResponse(html); }
-
-// register -> creates user and session cookie if (request.method === 'POST' && pathname === '/api/register') { try { const { nickname } = await request.json(); if (!nickname || String(nickname).length < 2) return jsonResponse({ error: 'Nickname too short' }, 400); const userId = uuidv4(); const user = { id: userId, nickname: String(nickname).slice(0, 20), balance: DEFAULT_BALANCE, created: Date.now() }; await env.SLOT_KV.put(user:${userId}, JSON.stringify(user)); await updateLeaderboard(env, user); const cookie = await createSession(env, userId); return jsonResponse({ ok: true, user: { id: userId, nickname: user.nickname, balance: user.balance } }, 200, { 'Set-Cookie': cookie }); } catch (e) { return jsonResponse({ error: 'Invalid request' }, 400); } }
-
-// get balance if (request.method === 'GET' && pathname === '/api/balance') { const userId = await parseSession(request, env); if (!userId) return jsonResponse({ balance: DEFAULT_BALANCE }); const user = await getUser(env, userId); if (!user) return jsonResponse({ balance: DEFAULT_BALANCE }); return jsonResponse({ balance: user.balance }); }
-
-// spin if (request.method === 'POST' && pathname === '/api/spin') { try { const userId = await parseSession(request, env); if (!userId) return jsonResponse({ error: 'Not authenticated' }, 401); const user = await getUser(env, userId); if (!user) return jsonResponse({ error: 'User not found' }, 404); const body = await request.json(); let bet = Number(body.bet || 0); if (!Number.isFinite(bet) || bet <= 0) return jsonResponse({ error: 'Invalid bet' }, 400); if (bet > user.balance) return jsonResponse({ error: 'Insufficient balance' }, 400);
-
-// perform spin
-  const result = await spinOnce();
-  const win = Math.floor(bet * result.winMul);
-  user.balance = Math.max(0, user.balance - bet + win);
-  user.lastSpin = { bet, reels: result.reels, win, winMul: result.winMul, ts: Date.now() };
-
-  // save user and update leaderboard async
-  await env.SLOT_KV.put(`user:${userId}`, JSON.stringify(user));
-  await updateLeaderboard(env, user);
-
-  // receipt hash for audit (HMAC of spin data)
-  const receipt = await makeSpinReceipt(env, userId, user.lastSpin);
-
-  return jsonResponse({ ok: true, reels: result.reels, win, winMul: result.winMul, balance: user.balance, receipt });
-} catch (e) {
-  return jsonResponse({ error: 'Invalid request' }, 400);
+  return new Response("Method not allowed", { status: 405 });
 }
 
+// ------- Server-side spin logic -------
+function serverSpin(bet) {
+  // 5 reels, 3 rows (center is the payline row)
+  const reels = 5;
+  const rows = 3;
+
+  // We will produce a matrix [reel][row] (top->bottom)
+  const matrix = [];
+  for (let r = 0; r < reels; r++) {
+    matrix[r] = [];
+    for (let y = 0; y < rows; y++) {
+      matrix[r].push(weightedRandomSymbolId());
+    }
+  }
+
+  // Evaluate wins on center horizontal payline (row index 1) and basic three/some combos
+  const centerLine = matrix.map((col) => col[1]); // array of symbol ids per reel on center row
+
+  // Simple pay evaluation:
+  // - if 5 of kind -> highest multiplier
+  // - if 4 of kind (left-to-right contiguous) -> somewhat
+  // - if 3 of kind -> base multiplier
+  // - two of kind -> small consolation
+  // This demo uses only center line for simplicity (can be expanded to many paylines)
+  const counts = centerLine.reduce((acc, s) => ((acc[s] = (acc[s] || 0) + 1), acc), {});
+  let payoutMultiplier = 0;
+  let winningSymbol = null;
+
+  for (const [sym, cnt] of Object.entries(counts)) {
+    if (cnt >= 3) {
+      // find symbol's multiplier
+      const sObj = SYMBOLS.find((x) => x.id === sym);
+      if (sObj) {
+        // scale multiplier by count: 3->base, 4-> 2× base, 5-> 4× base (example scaling)
+        const scale = cnt === 3 ? 1 : cnt === 4 ? 2 : 4;
+        payoutMultiplier = Math.max(payoutMultiplier, sObj.multiplier * scale);
+        winningSymbol = sym;
+      }
+    }
+  }
+
+  // two-of-kind consolation
+  if (payoutMultiplier === 0) {
+    for (const [sym, cnt] of Object.entries(counts)) {
+      if (cnt === 2) {
+        payoutMultiplier = Math.floor(5); // small constant multiplier for two-of-kind
+        winningSymbol = sym;
+        break;
+      }
+    }
+  }
+
+  // For "house-edge control", we implement a light rejection sampling:
+  // If payout looks too large relative to target RTP and bet, we may re-spin (limited attempts).
+  // WARNING: This is a simplified demo and not a certified RTP controller.
+  let winAmount = Math.floor(bet * payoutMultiplier);
+  // Quick control: if winAmount / bet is absurdly high relative to TARGET_PAYOUT_RATE, re-roll few times
+  // Bound attempts
+  let attempt = 0;
+  while (attempt < 6 && shouldRejectOutcome(winAmount, bet)) {
+    // re-generate
+    attempt++;
+    for (let r = 0; r < reels; r++) {
+      for (let y = 0; y < rows; y++) {
+        matrix[r][y] = weightedRandomSymbolId();
+      }
+    }
+    const newCenter = matrix.map((col) => col[1]);
+    const newCounts = newCenter.reduce((acc, s) => ((acc[s] = (acc[s] || 0) + 1), acc), {});
+    payoutMultiplier = 0;
+    winningSymbol = null;
+    for (const [sym, cnt] of Object.entries(newCounts)) {
+      if (cnt >= 3) {
+        const sObj = SYMBOLS.find((x) => x.id === sym);
+        if (sObj) {
+          const scale = cnt === 3 ? 1 : cnt === 4 ? 2 : 4;
+          payoutMultiplier = Math.max(payoutMultiplier, sObj.multiplier * scale);
+          winningSymbol = sym;
+        }
+      }
+    }
+    if (payoutMultiplier === 0) {
+      for (const [sym, cnt] of Object.entries(newCounts)) {
+        if (cnt === 2) {
+          payoutMultiplier = Math.floor(5);
+          winningSymbol = sym;
+          break;
+        }
+      }
+    }
+    winAmount = Math.floor(bet * payoutMultiplier);
+  }
+
+  // Build readable matrix with labels
+  const matrixLabeled = matrix.map((col) => col.map((id) => {
+    const s = SYMBOLS.find(x => x.id === id);
+    return { id, label: s ? s.label : id };
+  }));
+
+  const debug = {
+    attempts: attempt + 1,
+    payoutMultiplier,
+    winningSymbol,
+    centerLine,
+  };
+
+  return {
+    reels: matrixLabeled,
+    rows,
+    bet,
+    payoutMultiplier,
+    winAmount,
+    debug
+  };
 }
 
-// leaderboard if (request.method === 'GET' && pathname === '/api/leaderboard') { const board = await getLeaderboard(env); return jsonResponse({ leaderboard: board }); }
+function shouldRejectOutcome(winAmount, bet) {
+  // Simple heuristic: allow base variance but prevent extreme wins too often relative to bet.
+  // If winAmount > bet * (some threshold), reject with probability depending on target RTP.
+  if (winAmount === 0) return false;
+  const ratio = winAmount / bet;
+  // If ratio is huge, more likely to reject. This is only a demo.
+  if (ratio > 200) return Math.random() < 0.95;
+  if (ratio > 100) return Math.random() < 0.8;
+  if (ratio > 50) return Math.random() < 0.6;
+  // else accept
+  return false;
+}
 
-// reset user (dev helper) if (request.method === 'POST' && pathname === '/api/reset-user') { const userId = await parseSession(request, env); if (!userId) return jsonResponse({ error: 'Not authenticated' }, 401); const user = await getUser(env, userId); if (!user) return jsonResponse({ error: 'User not found' }, 404); user.balance = DEFAULT_BALANCE; await env.SLOT_KV.put(user:${userId}, JSON.stringify(user)); await updateLeaderboard(env, user); return jsonResponse({ ok: true, balance: user.balance }); }
+function weightedRandomSymbolId() {
+  // crypto-random 32-bit, map into [0, TOTAL_WEIGHT)
+  const r = secureRandomInt(TOTAL_WEIGHT);
+  let acc = 0;
+  for (const s of SYMBOLS) {
+    acc += s.weight;
+    if (r < acc) return s.id;
+  }
+  // fallback
+  return SYMBOLS[SYMBOLS.length - 1].id;
+}
 
-// admin stats (admin token required) if (request.method === 'GET' && pathname === '/api/admin/stats') { const token = request.headers.get('x-admin-token') || ''; if (!token || token !== (env.ADMIN_TOKEN || '')) return jsonResponse({ error: 'Unauthorized' }, 401); // basic stats const board = await getLeaderboard(env); return jsonResponse({ users: board.length, top: board.slice(0, 10) }); }
+function secureRandomInt(max) {
+  // returns int in [0, max)
+  // Use crypto.getRandomValues
+  const array = new Uint32Array(1);
+  crypto.getRandomValues(array);
+  // Convert to float in [0,1)
+  const x = array[0] / 0x100000000;
+  return Math.floor(x * max);
+}
 
-return new Response('Not found', { status: 404 }); }
+// ------- Utilities -------
+function jsonResponse(obj, status = 200) {
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
+  });
+}
 
-async function makeSpinReceipt(env, userId, spin) { const payload = JSON.stringify({ userId, spin, ts: Date.now() }); const key = await importHmacKey(env.SECRET_KEY || 'dev_secret'); const sig = await signValue(key, btoa(payload)); return { hash: sig, payload: btoa(payload) }; }
-
-// ---------------------- Frontend (renderHTML) ---------------------- function renderHTML(nickname, balance) { // Modern single-file UI. Keep CSS small and self-contained for Worker. return `<!doctype html>
-
-<html lang="en">
+// ------- Frontend HTML (inline, minimal external deps) -------
+const HTML_PAGE = `<!doctype html>
+<html lang="id">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Slot PRO — Cloudflare Worker</title>
+<title>Pragmatic-style Slot — Worker Demo</title>
 <style>
-:root{--bg:#0b1220;--card:#081226;--accent:#ffb703;--muted:#94a3b8}
-*{box-sizing:border-box}
-html,body{height:100%;margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial}
-body{background:linear-gradient(180deg,#061121 0%,#071827 100%);color:#e6eef8;display:flex;align-items:center;justify-content:center;padding:20px}
-.container{width:100%;max-width:1100px}
-.header{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}
-.brand{display:flex;gap:12px;align-items:center}
-.logo{width:56px;height:56px;border-radius:12px;background:linear-gradient(135deg,#06b6d4,#7c3aed);display:flex;align-items:center;justify-content:center;font-weight:900}
-.panel{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));border:1px solid rgba(255,255,255,0.03);padding:18px;border-radius:12px}
-.grid{display:grid;grid-template-columns:1fr 360px;gap:18px}
-.reels{display:flex;gap:12px;justify-content:center;margin:18px 0}
-.reel{width:140px;height:140px;border-radius:12px;background:rgba(255,255,255,0.03);display:flex;align-items:center;justify-content:center;font-size:48px;font-weight:800;transition:transform 0.6s ease}
-.controls{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
-.btn{background:var(--accent);color:#062a3a;padding:10px 14px;border-radius:10px;border:none;font-weight:800;cursor:pointer}
-.btn.ghost{background:transparent;border:1px solid rgba(255,255,255,0.04);color:var(--muted)}
-.info{font-size:14px;color:var(--muted)}
-.log{margin-top:12px;padding:8px;border-radius:8px;height:140px;overflow:auto;background:rgba(0,0,0,0.25);font-family:monospace}
-.input{padding:10px;border-radius:10px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:inherit}
-.leaderboard{display:flex;flex-direction:column;gap:8px}
-.lb-item{display:flex;justify-content:space-between;align-items:center;padding:8px;border-radius:8px;background:rgba(255,255,255,0.02)}
-@media(max-width:900px){.grid{grid-template-columns:1fr}.reel{width:100px;height:100px;font-size:32px}}
+  :root{
+    --bg:#061022; --panel:#0c1724; --accent:#f59e0b; --muted:#94a3b8; --glass: rgba(255,255,255,0.03);
+    --win:#16a34a; --bigwin:#ffb020;
+  }
+  *{box-sizing:border-box}
+  body{margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center; background: radial-gradient(circle at 20% 30%, #08203a 0%, #040615 60%); font-family: Inter, system-ui, Arial; color:#e6eef8}
+  .wrap{width:1100px; max-width:98%; padding:20px;}
+  .top{display:flex; justify-content:space-between; align-items:center; gap:12px}
+  h1{margin:0; font-size:20px}
+  .machine-area{display:flex; gap:16px; margin-top:16px}
+  .machine{background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border-radius:14px; padding:18px; display:flex; gap:18px; align-items:center; box-shadow: 0 10px 30px rgba(2,6,23,0.6);}
+  .reels{display:grid; grid-template-columns: repeat(5, 1fr); gap:8px; width:740px;}
+  .reel{height:220px; background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(0,0,0,0.12)); border-radius:12px; overflow:hidden; position:relative; display:flex; align-items:center; justify-content:center}
+  .strip{position:absolute; left:0; right:0; top:0; transition: transform 1s cubic-bezier(.18,.9,.32,1); display:flex; flex-direction:column; align-items:center;}
+  .cell{height:220px; width:100%; display:flex; align-items:center; justify-content:center; font-size:46px; font-weight:700; text-shadow: 0 6px 18px rgba(0,0,0,0.6);}
+  .payline{position:absolute; left:0; right:0; top:33.33%; height:4px; background: linear-gradient(90deg, transparent, var(--accent), transparent); opacity:0.95}
+  .control-panel{width:300px; display:flex; flex-direction:column; gap:10px}
+  .panel-box{background:rgba(255,255,255,0.02); padding:12px; border-radius:10px}
+  button{border:0; background:var(--accent); color:#071022; padding:10px 12px; border-radius:10px; font-weight:700; cursor:pointer}
+  .secondary{background:transparent; color:var(--muted); border:1px solid rgba(255,255,255,0.04)}
+  input[type=number]{width:100%; padding:8px; border-radius:8px; background:transparent; border:1px solid rgba(255,255,255,0.04); color:inherit}
+  .muted{color:var(--muted); font-size:13px}
+  .bigwin{position:fixed; left:50%; top:18%; transform:translateX(-50%); background:linear-gradient(90deg,#ffefc0,#ffd769); color:#301400; padding:18px 30px; border-radius:16px; font-size:28px; font-weight:900; box-shadow:0 18px 60px rgba(255,183,60,0.18); display:none; z-index:9999}
+  .hud{display:flex; gap:8px; align-items:center}
+  .chip{background:rgba(0,0,0,0.25); padding:8px 10px; border-radius:10px}
+  @media(max-width:1100px){ .reels{width:520px} .cell{font-size:34px} .reel{height:160px} .cell{height:160px} }
+  @media(max-width:760px){ .machine-area{flex-direction:column} .reels{width:100%} .control-panel{width:100%} }
 </style>
 </head>
 <body>
-  <div class="container">
-    <div class="header">
-      <div class="brand">
-        <div class="logo">SP</div>
-        <div>
-          <div style="font-weight:900">Slot PRO — Worker Edition</div>
-          <div class="info">Server-side RNG · Persistent balances · Leaderboard</div>
-        </div>
-      </div>
-      <div class="panel" style="display:flex;flex-direction:column;align-items:flex-end">
-        <div style="font-size:13px;color:var(--muted)">User</div>
-        <div style="font-weight:800">${nickname ? escapeHtml(nickname) : 'Guest'}</div>
-        <div style="margin-top:8px;font-size:14px">Balance: <span id="balVal" style="font-weight:900">${balance}</span></div>
-      </div>
-    </div><div class="grid">
-  <div class="panel">
-    <div style="text-align:center">
-      <div style="font-size:13px;color:var(--muted)">Bet (coins)</div>
-      <div style="margin-top:8px;display:flex;gap:8px;justify-content:center;align-items:center" class="controls">
-        <button class="btn ghost" id="minBet">1</button>
-        <button class="btn ghost" id="b10">10</button>
-        <button class="btn ghost" id="b50">50</button>
-        <input id="betInput" class="input" type="number" value="10" min="1" style="width:120px;text-align:center">
-        <button id="spinBtn" class="btn">SPIN</button>
-      </div>
+<div class="bigwin" id="bigwin">BIG WIN!</div>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <h1>🎰 Pragmatic-style Slot — Worker Demo</h1>
+      <div class="muted">Server RNG (Worker) • 5 reels × 3 rows • Secure demo</div>
     </div>
-
-    <div class="reels" aria-hidden="true">
-      <div class="reel" id="r0">—</div>
-      <div class="reel" id="r1">—</div>
-      <div class="reel" id="r2">—</div>
+    <div class="hud">
+      <div class="chip">Balance: <strong id="balance">10000</strong></div>
+      <div class="chip">Bet: <strong id="betShow">10</strong></div>
+      <div class="chip">Wins: <strong id="wins">0</strong></div>
     </div>
-
-    <div style="display:flex;gap:8px;justify-content:center">
-      <button id="addCoins" class="btn ghost">+100</button>
-      <button id="reset" class="btn ghost">Reset</button>
-      <button id="register" class="btn ghost">Register</button>
-    </div>
-
-    <div class="log" id="log"></div>
   </div>
 
-  <div class="panel">
-    <h3 style="margin:0 0 8px 0">Leaderboard</h3>
-    <div class="leaderboard" id="leaderboard"></div>
-    <hr style="margin:12px 0;border:none;border-top:1px solid rgba(255,255,255,0.03)">
-    <div style="font-size:13px;color:var(--muted)">Payouts</div>
-    <pre style="font-family:monospace;color:var(--muted);margin:8px 0">3× 🍒 => 2×
+  <div class="machine-area">
+    <div class="machine">
+      <div class="reels" id="reels">
+        <!-- 5 reel containers -->
+        <div class="reel" data-i="0"><div class="strip" id="strip-0"></div><div class="payline"></div></div>
+        <div class="reel" data-i="1"><div class="strip" id="strip-1"></div><div class="payline"></div></div>
+        <div class="reel" data-i="2"><div class="strip" id="strip-2"></div><div class="payline"></div></div>
+        <div class="reel" data-i="3"><div class="strip" id="strip-3"></div><div class="payline"></div></div>
+        <div class="reel" data-i="4"><div class="strip" id="strip-4"></div><div class="payline"></div></div>
+      </div>
 
-3× 🍋 => 3× 3× 🔔 => 10× 3× ⭐ => 25× 3× 💎 => 100× (super jackpot possible)</pre> </div> </div>
+      <div style="display:flex; flex-direction:column; gap:8px; margin-left:12px;">
+        <button id="spinBtn">SPIN</button>
+        <button id="autoBtn" class="secondary">AUTO</button>
+        <button id="turboBtn" class="secondary">TURBO</button>
+      </div>
+    </div>
 
-  </div><script>
-// minimal helper utilities
-function el(id){return document.getElementById(id)}
-function appendLog(t){el('log').textContent = t + '
-' + el('log').textContent}
-function toJSON(r){try{return r.json()}catch(e){return {}}}
+    <div class="control-panel">
+      <div class="panel-box">
+        <div class="muted">Set Bet</div>
+        <input type="number" id="betInput" value="10" min="1" />
+        <div style="display:flex; gap:8px; margin-top:8px;">
+          <button id="plus">+10</button><button id="minus" class="secondary">-10</button>
+        </div>
+      </div>
 
-async function api(path, opts){
-  const res = await fetch(path, opts);
-  try{return await res.json();}catch(e){return {}};
-}
+      <div class="panel-box">
+        <div class="muted">Options</div>
+        <label><input type="checkbox" id="sound" checked> Sound</label><br>
+        <label class="muted">Autoplay Delay: <input id="delay" type="number" value="800" min="100" step="100"/> ms</label>
+      </div>
 
-el('minBet').onclick = ()=> el('betInput').value = 1;
-el('b10').onclick = ()=> el('betInput').value = 10;
-el('b50').onclick = ()=> el('betInput').value = 50;
+      <div class="panel-box">
+        <div class="muted">Paytable (center line)</div>
+        <div id="paytable" class="muted"></div>
+      </div>
+    </div>
+  </div>
+</div>
 
-el('addCoins').onclick = async ()=>{
-  // developer test: add 100 via reset API
-  const r = await api('/api/add-dev', { method: 'POST' });
-  await refreshBalance();
-  appendLog('+100 added');
-};
+<script>
+(() => {
+  const SYMBOLS = [
+    { id: "diamond", label: "💎" },
+    { id: "seven", label: "7️⃣" },
+    { id: "star", label: "⭐" },
+    { id: "bell", label: "🔔" },
+    { id: "lemon", label: "🍋" },
+    { id: "cherry", label: "🍒" },
+  ];
+  const paytableMap = { diamond:500, seven:200, star:100, bell:60, lemon:30, cherry:10 };
 
-el('reset').onclick = async ()=>{
-  await api('/api/reset-user', { method: 'POST' });
-  await refreshBalance();
-  appendLog('Balance reset');
-};
+  let balance = 10000;
+  let bet = 10;
+  let wins = 0;
+  let auto = false;
+  let turbo = false;
 
-el('register').onclick = async ()=>{
-  const nick = prompt('Choose a nickname (2-20 chars)');
-  if (!nick) return;
-  const r = await api('/api/register', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ nickname: nick }) });
-  if (r && r.ok) {
-    appendLog('Registered as ' + r.user.nickname);
-    await refreshBalance();
-    fetchLeaderboard();
-  } else appendLog('Register failed: ' + (r.error || 'unknown'));
-};
+  const balanceEl = document.getElementById('balance');
+  const betShow = document.getElementById('betShow');
+  const winsEl = document.getElementById('wins');
+  const spinBtn = document.getElementById('spinBtn');
+  const autoBtn = document.getElementById('autoBtn');
+  const turboBtn = document.getElementById('turboBtn');
+  const betInput = document.getElementById('betInput');
+  const plus = document.getElementById('plus');
+  const minus = document.getElementById('minus');
+  const delayInput = document.getElementById('delay');
+  const soundToggle = document.getElementById('sound');
+  const bigwinEl = document.getElementById('bigwin');
 
-async function refreshBalance(){
-  const r = await api('/api/balance');
-  if (r && typeof r.balance !== 'undefined') el('balVal').textContent = r.balance;
-}
+  const stripEls = [0,1,2,3,4].map(i => document.getElementById('strip-'+i));
+  const baseDur = 900;
 
-async function fetchLeaderboard(){
-  const r = await api('/api/leaderboard');
-  const container = el('leaderboard');
-  container.innerHTML = '';
-  if (r && Array.isArray(r.leaderboard)){
-    r.leaderboard.forEach((it, i)=>{
-      const node = document.createElement('div');
-      node.className = 'lb-item';
-      node.innerHTML = `<div style="font-weight:800">${i+1}. ${escapeHtml(it.nickname)}</div><div>${it.balance}</div>`;
-      container.appendChild(node);
+  function renderPaytable(){
+    const el = document.getElementById('paytable');
+    el.innerHTML = Object.keys(paytableMap).map(k => \`\${SYMBOLS.find(s=>s.id===k)?.label || k} : ×\${paytableMap[k]}\`).join('<br>');
+  }
+
+  function updateHUD(){ balanceEl.textContent = balance; betShow.textContent = bet; winsEl.textContent = wins; betInput.value = bet; }
+
+  function buildStrips(){ // simple repeated symbols for visual
+    stripEls.forEach((strip) => {
+      strip.innerHTML = '';
+      for(let rep=0; rep<8; rep++){
+        for(const s of SYMBOLS){
+          const div = document.createElement('div');
+          div.className = 'cell';
+          div.textContent = s.label;
+          strip.appendChild(div);
+        }
+      }
     });
   }
-}
 
-el('spinBtn').onclick = async ()=>{
-  const bet = Number(el('betInput').value || 0);
-  if (!bet || bet <= 0) { appendLog('Enter a valid bet'); return; }
-  appendLog('Spinning — bet: ' + bet);
-  const r = await api('/api/spin', { method: 'POST', headers: {'content-type':'application/json'}, body: JSON.stringify({ bet }) });
-  if (r && r.ok){
-    // animate
-    el('r0').textContent = '...'; el('r1').textContent = '...'; el('r2').textContent = '...';
-    setTimeout(()=>{ el('r0').textContent = r.reels[0]; el('r1').textContent = r.reels[1]; el('r2').textContent = r.reels[2]; }, 600);
-    appendLog(`Result: ${r.reels.join(' | ')}  Win: ${r.win}  Bal: ${r.balance}`);
-    el('balVal').textContent = r.balance;
-    fetchLeaderboard();
-  } else {
-    appendLog('Error: ' + (r && r.error ? r.error : 'unknown'));
+  async function doSpin() {
+    if (bet > balance) { alert('Saldo tidak cukup'); return; }
+    balance -= bet; updateHUD();
+    // ask worker /spin for result
+    try {
+      const resp = await fetch('/spin', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ bet }) });
+      const data = await resp.json();
+      if (data.error) { alert(data.message || 'Server error'); return; }
+
+      // animate strips to their result
+      // matrix: data.reels is [reel][row]{id,label}
+      for (let i=0;i<5;i++){
+        const strip = stripEls[i];
+        // find index of a center occurrence of the symbol inside our repeated strip
+        const targetId = data.reels[i][1].id; // center row
+        // find symbol index in SYMBOLS to compute offset
+        const symIndex = SYMBOLS.findIndex(s => s.id === targetId);
+        const symbolHeight = (strip.children[0] && strip.children[0].offsetHeight) || 220;
+        // place into middle repetition so animation looks nice
+        const repeatCount = 8;
+        const midRepeat = Math.floor(repeatCount/2);
+        const indexInStrip = symIndex + SYMBOLS.length * midRepeat;
+        const totalHeight = SYMBOLS.length * repeatCount * symbolHeight;
+        const cycles = turbo ? 1 + Math.floor(Math.random()*2) : 2 + Math.floor(Math.random()*3);
+        const offset = -(cycles * totalHeight) - (indexInStrip * symbolHeight);
+        // set duration with stagger
+        const duration = (baseDur + i*130) * (turbo?0.6:1);
+        strip.style.transition = \`transform \${duration}ms cubic-bezier(.18,.9,.32,1)\`;
+        // small timeout to ensure transition applied
+        setTimeout(()=> strip.style.transform = \`translateY(\${offset}px)\`, 30);
+      }
+
+      // wait for longest animation
+      await new Promise(r => setTimeout(r, (baseDur + 4*130) * (turbo?0.6:1) + 120));
+
+      // display win/loss
+      const win = data.winAmount || 0;
+      if (win > 0) {
+        balance += win;
+        wins += win;
+        updateHUD();
+        showWin(win, data.payoutMultiplier);
+      } else {
+        updateHUD();
+      }
+
+      // snap back strips visually to original repeat (without transition) after short delay
+      setTimeout(()=> {
+        stripEls.forEach(s => { s.style.transition = 'none'; s.style.transform = 'translateY(0px)'; });
+      }, 300);
+
+    } catch (e) {
+      alert('Gagal terhubung ke server spin: ' + e);
+    }
   }
-}
 
-// small helper to escape HTML
-function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])) }
+  function showWin(amount, mult) {
+    // Big Win thresholds
+    if (amount >= bet * 200) {
+      bigwinEl.textContent = 'MEGA WIN! +' + amount;
+      bigwinEl.style.display = 'block';
+      bigwinEl.style.transform = 'translateX(-50%) scale(1.08)';
+      setTimeout(()=>{ bigwinEl.style.display='none'; bigwinEl.style.transform='translateX(-50%) scale(1)'; }, 2200);
+    } else if (amount >= bet * 50) {
+      bigwinEl.textContent = 'BIG WIN! +' + amount;
+      bigwinEl.style.display = 'block';
+      setTimeout(()=>{ bigwinEl.style.display='none'; }, 1600);
+    } else {
+      // small pop
+      const el = document.createElement('div');
+      el.textContent = '+ ' + amount;
+      el.style.position = 'absolute';
+      el.style.left = '50%';
+      el.style.top = '12%';
+      el.style.transform = 'translateX(-50%)';
+      el.style.padding = '8px 12px';
+      el.style.borderRadius = '8px';
+      el.style.background = 'rgba(255,255,255,0.08)';
+      document.body.appendChild(el);
+      setTimeout(()=> el.remove(), 900);
+    }
+    // sound
+    if (soundToggle.checked) playWinSound();
+  }
 
-// initial
-refreshBalance(); fetchLeaderboard();
-</script></body>
+  // Basic WebAudio fx
+  let audioCtx = null;
+  function playBeep(freq, dur=0.05) {
+    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const o = audioCtx.createOscillator();
+    const g = audioCtx.createGain();
+    o.connect(g); g.connect(audioCtx.destination);
+    o.type='sine'; o.frequency.value = freq;
+    g.gain.value = 0.06;
+    o.start(); o.stop(audioCtx.currentTime + dur);
+  }
+  function playWinSound() {
+    playBeep(600, 0.12);
+    setTimeout(()=>playBeep(900,0.08), 120);
+  }
+
+  // UI events
+  spinBtn.addEventListener('click', ()=> { doSpin(); });
+  autoBtn.addEventListener('click', ()=> {
+    auto = !auto;
+    autoBtn.textContent = auto ? 'STOP' : 'AUTO';
+    autoBtn.classList.toggle('secondary', !auto);
+    if (auto) autoLoop();
+  });
+  turboBtn.addEventListener('click', ()=> { turbo = !turbo; turboBtn.textContent = turbo ? 'TURBO ✓' : 'TURBO'; turboBtn.classList.toggle('secondary', !turbo); });
+
+  async function autoLoop(){
+    while (auto && balance >= bet) {
+      await doSpin();
+      await new Promise(r => setTimeout(r, Math.max(50, Number(delayInput.value) || 500)));
+    }
+    auto = false;
+    autoBtn.textContent = 'AUTO';
+    autoBtn.classList.add('secondary');
+  }
+
+  plus.addEventListener('click', ()=> { bet += 10; updateHUD(); });
+  minus.addEventListener('click', ()=> { bet = Math.max(1, bet - 10); updateHUD(); });
+  betInput.addEventListener('change', ()=> { bet = Math.max(1, Math.floor(Number(betInput.value) || 1)); updateHUD(); });
+
+  // Build UI
+  renderPaytable();
+  buildStrips();
+  updateHUD();
+
+  // keyboard space -> spin
+  window.addEventListener('keydown', (e) => { if (e.code === 'Space') { e.preventDefault(); doSpin(); }});
+})();
+</script>
+</body>
 </html>`;
-}function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&','<':'<','>':'>','"':'"',"'":'''}[c])) }
-
-  
