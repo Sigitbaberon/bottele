@@ -1,111 +1,145 @@
 export default {
   async fetch(request, env) {
-    // ⚠️ Ganti token ini dengan token bot kamu sendiri
     const TOKEN = "7522192709:AAFDwX-Lng-_3FUtr6oAiFu-nfD_XLMCsd8";
-    const ADMIN_ID = 7729648778; // ID admin atau grup laporan
-    const url = `https://api.telegram.org/bot${TOKEN}`;
+    const ADMIN_ID = 7729648778;
+    const API = `https://api.telegram.org/bot${TOKEN}`;
+    const WARN_LIMIT = 3;
 
-    // Kata terlarang dan pola link mencurigakan
-    const bannedWords = ["porno", "sex", "http://", "https://", "t.me/", "joinchat"];
-    const warnings = {}; // penyimpanan sementara per user
+    // Penyimpanan sementara (reset jika worker restart)
+    if (!globalThis.warns) globalThis.warns = {};
 
     if (request.method === "POST") {
       const update = await request.json();
       const msg = update.message;
-      if (!msg || !msg.chat) return new Response("No message");
+
+      if (!msg) return new Response("No message");
 
       const chatId = msg.chat.id;
-      const text = msg.text ? msg.text.toLowerCase() : "";
-      const user = msg.from;
-      const userId = user.id;
-      const username = user.username ? `@${user.username}` : user.first_name;
+      const from = msg.from;
+      const text = msg.text || "";
 
-      // --- [1] Deteksi kata terlarang / spam ---
-      for (const word of bannedWords) {
-        if (text.includes(word)) {
-          await fetch(`${url}/deleteMessage`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ chat_id: chatId, message_id: msg.message_id }),
-          });
+      // 🧩 1. Deteksi anggota baru
+      if (msg.new_chat_members) {
+        for (const member of msg.new_chat_members) {
+          // Abaikan bot
+          if (member.is_bot) continue;
 
-          // Tambah peringatan
-          warnings[userId] = (warnings[userId] || 0) + 1;
-          const warnCount = warnings[userId];
+          // Jika yang menambahkan adalah admin → jangan kick
+          if (msg.from && (await isAdmin(API, chatId, msg.from.id))) {
+            await sendMessage(API, chatId, `✅ ${member.first_name} ditambahkan oleh admin.`);
+            await sendMessage(API, ADMIN_ID, `ℹ️ ${member.first_name} ditambahkan oleh admin. Aman.`);
+            continue;
+          }
 
-          if (warnCount >= 3) {
-            // Ban otomatis
-            await fetch(`${url}/kickChatMember`, {
+          // Cek foto profil
+          const photos = await fetch(`${API}/getUserProfilePhotos?user_id=${member.id}`).then(r => r.json());
+          const photoCount = photos.ok ? photos.result.total_count : 0;
+
+          const username = member.username ? `@${member.username}` : "(tidak ada)";
+          const name = member.first_name || "Tanpa Nama";
+
+          let profileInfo = `👤 <b>Anggota Baru</b>\nNama: ${name}\nUsername: ${username}\nID: <code>${member.id}</code>\nFoto Profil: ${photoCount}`;
+          await sendMessage(API, chatId, profileInfo);
+
+          // Jika tidak ada foto → kasih peringatan
+          if (photoCount === 0) {
+            const key = `${chatId}:${member.id}`;
+            globalThis.warns[key] = (globalThis.warns[key] || 0) + 1;
+            const warnCount = globalThis.warns[key];
+
+            if (warnCount >= WARN_LIMIT) {
+              await fetch(`${API}/kickChatMember`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ chat_id: chatId, user_id: member.id }),
+              });
+              await sendMessage(API, chatId, `🚫 ${name} (${username}) dikeluarkan karena tidak punya foto profil.`);
+              await sendMessage(API, ADMIN_ID, `🚨 ${name} (${username}) dikeluarkan otomatis setelah ${warnCount} peringatan.`);
+              delete globalThis.warns[key];
+            } else {
+              await sendMessage(API, chatId, `⚠️ ${name}, kamu belum punya foto profil. Peringatan ke-${warnCount}/${WARN_LIMIT}.`);
+              await sendMessage(API, ADMIN_ID, `⚠️ ${name} (${username}) tidak punya foto profil. Peringatan ${warnCount}/${WARN_LIMIT}.`);
+            }
+          } else {
+            await sendMessage(API, chatId, `👋 Selamat datang, ${name}!`);
+          }
+        }
+        return new Response("OK");
+      }
+
+      // 🧩 2. Perintah admin
+      if (text.startsWith("/")) {
+        const [command, arg] = text.split(" ");
+        if (!(await isAdmin(API, chatId, from.id)) && from.id !== ADMIN_ID) {
+          await sendMessage(API, chatId, "❌ Kamu bukan admin!");
+          return new Response("Unauthorized");
+        }
+
+        const userId = parseInt(arg);
+        if (isNaN(userId)) {
+          await sendMessage(API, chatId, "⚠️ Harus pakai ID numerik.");
+          return new Response("Invalid ID");
+        }
+
+        switch (command) {
+          case "/warn":
+            globalThis.warns[`${chatId}:${userId}`] = (globalThis.warns[`${chatId}:${userId}`] || 0) + 1;
+            await sendMessage(API, chatId, `⚠️ User ${userId} diberi peringatan.`);
+            break;
+          case "/clearwarn":
+            delete globalThis.warns[`${chatId}:${userId}`];
+            await sendMessage(API, chatId, `✅ Peringatan untuk ${userId} dihapus.`);
+            break;
+          case "/warns":
+            const count = globalThis.warns[`${chatId}:${userId}`] || 0;
+            await sendMessage(API, chatId, `ℹ️ Peringatan user ${userId}: ${count}/${WARN_LIMIT}`);
+            break;
+          case "/ban":
+            await fetch(`${API}/kickChatMember`, {
               method: "POST",
               headers: { "content-type": "application/json" },
               body: JSON.stringify({ chat_id: chatId, user_id: userId }),
             });
-            await sendMessage(url, chatId, `🚫 ${username} dibanned otomatis (3x peringatan).`);
-            await sendMessage(url, ADMIN_ID, `🚨 ${username} dibanned dari grup ${chatId}`);
-            delete warnings[userId];
-          } else {
-            await sendMessage(url, chatId, `⚠️ ${username}, peringatan ke-${warnCount}.`);
-            await sendMessage(url, ADMIN_ID, `⚠️ ${username} mengirim konten terlarang (warn ${warnCount}).`);
-          }
-          return new Response("Warned");
-        }
-      }
-
-      // --- [2] Perintah admin manual ---
-      if (text.startsWith("/")) {
-        const parts = text.split(" ");
-        const command = parts[0];
-        const target = parts[1];
-
-        const adminActions = {
-          "/ban": "kickChatMember",
-          "/mute": "restrictChatMember",
-          "/unban": "unbanChatMember",
-        };
-
-        if (adminActions[command]) {
-          const action = adminActions[command];
-          const payload = { chat_id: chatId, user_id: parseInt(target) || userId };
-          if (command === "/mute") payload.permissions = { can_send_messages: false };
-
-          await fetch(`${url}/${action}`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify(payload),
-          });
-
-          await sendMessage(url, chatId, `✅ ${command.replace("/", "")} ${target} berhasil.`);
-          await sendMessage(url, ADMIN_ID, `🛠 Admin menjalankan ${command} terhadap ${target}`);
-          return new Response("Command done");
-        }
-      }
-
-      // --- [3] Deteksi anggota baru ---
-      if (msg.new_chat_members) {
-        for (const member of msg.new_chat_members) {
-          if (!member.is_bot && !member.photo) {
-            await fetch(`${url}/kickChatMember`, {
+            await sendMessage(API, chatId, `🚫 User ${userId} dikeluarkan oleh admin.`);
+            break;
+          case "/unban":
+            await fetch(`${API}/unbanChatMember`, {
               method: "POST",
               headers: { "content-type": "application/json" },
-              body: JSON.stringify({ chat_id: chatId, user_id: member.id }),
+              body: JSON.stringify({ chat_id: chatId, user_id: userId }),
             });
-            await sendMessage(url, chatId, `🚫 ${member.first_name} dikeluarkan (tidak ada foto profil).`);
-            await sendMessage(url, ADMIN_ID, `👤 ${member.first_name} dikeluarkan otomatis (no photo).`);
-          }
+            await sendMessage(API, chatId, `✅ User ${userId} telah diunban.`);
+            break;
+          default:
+            await sendMessage(API, chatId, "❓ Perintah tidak dikenal.");
         }
+
+        return new Response("Command OK");
       }
 
       return new Response("OK");
     }
 
-    return new Response("Bot Satpam Sakti v2 aktif ✅");
+    return new Response("Bot aktif ✅");
   },
 };
 
-async function sendMessage(url, chatId, text) {
-  await fetch(`${url}/sendMessage`, {
+// 🔧 Fungsi bantu
+async function sendMessage(API, chatId, text, parse = "HTML") {
+  await fetch(`${API}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: parse }),
   });
-                }
+}
+
+async function isAdmin(API, chatId, userId) {
+  try {
+    const res = await fetch(`${API}/getChatMember?chat_id=${chatId}&user_id=${userId}`).then(r => r.json());
+    if (!res.ok) return false;
+    const s = res.result.status;
+    return s === "creator" || s === "administrator";
+  } catch {
+    return false;
+  }
+              }
