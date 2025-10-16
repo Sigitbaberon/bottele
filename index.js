@@ -1,181 +1,191 @@
-// bot-satpam-lisensi-fix.js
-// Satpam Bot dengan lisensi - admin sudah diperbaiki
+// bot-satpam-lisensi-fix-nospam.js
+// ✅ Versi fix anti-spam loop Telegram
+// Bot Satpam Berlisensi (Cloudflare Worker) — by GPT-5
 
-const FALLBACK_TOKEN = "7819500627:AAGR8QKx4G7J-HMBczMVj3GT3aTBgcBLmlo"; // token bot kamu
-const ADMIN_IDS = [5560906270]; // kamu adalah admin utama
+const TOKEN = "7819500627:AAGR8QKx4G7J-HMBczMVj3GT3aTBgcBLmlo";
+const ADMIN_IDS = [5560906270];
+const API = `https://api.telegram.org/bot${TOKEN}`;
 const QRIS_LINK = "https://raw.githubusercontent.com/Sigitbaberon/qris/refs/heads/main/qr_ID1025423347687_29.09.25_175910930_1759109315016.jpeg";
-const LICENSE_VALID_DAYS = 30;
-const MS_IN_DAY = 24 * 3600 * 1000;
+const LICENSE_DAYS = 30;
+const DAY_MS = 24 * 3600 * 1000;
+
+// --- Memory storage (non-KV)
+if (!globalThis.DB) {
+  globalThis.DB = {
+    HANDLED: new Set(),   // untuk mencegah spam / loop
+    PENDING: {},
+    LICENSES: {},
+  };
+}
 
 export default {
-  async fetch(request) {
-    const TOKEN = FALLBACK_TOKEN;
-    const API = `https://api.telegram.org/bot${TOKEN}`;
+  async fetch(req) {
+    if (req.method !== "POST") return new Response("Bot aktif ✅");
+    const update = await req.json();
 
-    if (!globalThis.LIC) {
-      globalThis.LIC = {
-        PENDING: {},
-        LICENSES: {},
-        GROUPS: {},
-      };
+    // Ambil data update
+    const msg = update.message;
+    if (!msg) return new Response("No message");
+
+    const idKey = `${msg.chat.id}-${msg.message_id}`;
+    if (globalThis.DB.HANDLED.has(idKey)) return new Response("Duplicate ignored");
+    globalThis.DB.HANDLED.add(idKey);
+
+    try {
+      await handleMessage(msg);
+    } catch (err) {
+      console.error("Bot error:", err);
+      await safeSend(ADMIN_IDS[0], `❗Error: ${err.message}`);
     }
 
-    if (request.method === "POST") {
-      const update = await request.json();
-      if (update.message) return handleMessage(update.message, API);
-    }
-
-    return new Response("Bot Satpam Berlisensi Aktif ✅");
+    // ⚡ Telegram butuh respon cepat
+    return new Response("ok", { status: 200 });
   },
 };
 
-async function handleMessage(msg, API) {
+// === CORE ===
+async function handleMessage(msg) {
   const chatId = msg.chat.id;
   const from = msg.from || {};
   const userId = from.id;
   const text = (msg.text || "").trim();
   const isPrivate = msg.chat.type === "private";
-
-  // ✅ cek apakah pengirim adalah admin
   const isAdmin = ADMIN_IDS.includes(userId);
 
-  // --- Mode Private Chat (/start, pembayaran, lisensi) ---
+  // === PRIVATE CHAT ===
   if (isPrivate) {
     // /start
     if (text === "/start") {
-      await sendMessage(API, chatId, 
-        `👋 Halo ${from.first_name || "User"}!\n\n` +
-        `Untuk menggunakan Satpam Bot di grup, kamu perlu lisensi aktif selama ${LICENSE_VALID_DAYS} hari.\n` +
-        `Silakan bayar melalui QRIS berikut, lalu kirim bukti transfer (foto) ke sini.`
+      await sendMessage(
+        chatId,
+        `👋 Halo ${from.first_name || "teman"}!\n\n` +
+          `Bot ini adalah *Satpam Grup* dengan sistem lisensi berlangganan.\n` +
+          `Untuk aktivasi, silakan bayar lewat QRIS di bawah lalu kirim bukti transfer ke sini.`,
+        "Markdown"
       );
-      await sendPhoto(API, chatId, QRIS_LINK, "Scan QRIS di atas untuk pembayaran.");
+      await sendPhoto(chatId, QRIS_LINK, "📷 Scan QRIS di atas untuk membayar lisensi 30 hari.");
       return;
     }
 
-    // Jika kirim foto bukti pembayaran
+    // Foto bukti pembayaran
     if (msg.photo) {
       const largest = msg.photo[msg.photo.length - 1];
-      const code = generateLicenseCode();
-      globalThis.LIC.PENDING[userId] = {
+      const code = genCode();
+      globalThis.DB.PENDING[userId] = {
         userId,
         username: from.username || "",
-        photoId: largest.file_id,
+        fileId: largest.file_id,
         code,
         ts: Date.now(),
       };
-      await sendMessage(API, chatId, `✅ Bukti kamu sudah diterima.\nKode verifikasi: <code>${code}</code>\nTunggu admin menyetujuinya.`);
+      await sendMessage(chatId, `✅ Bukti diterima!\nKode verifikasi: \`${code}\`\nTunggu admin menyetujuinya.`, "Markdown");
       for (const adminId of ADMIN_IDS) {
-        await sendMessage(API, adminId, 
-          `💰 Bukti pembayaran dari ${formatUser(from)}\nKode: ${code}\nGunakan /approve ${userId} atau /reject ${userId}.`
-        );
+        await sendMessage(adminId, `💰 Bukti pembayaran baru dari [${from.first_name}](tg://user?id=${userId})\nKode: \`${code}\`\nGunakan /approve ${userId} atau /reject ${userId}.`, "Markdown");
       }
       return;
     }
 
-    // Jika user kirim kode lisensi
+    // User kirim kode lisensi
     if (/^LS-[A-Z0-9-]+$/i.test(text)) {
-      const lic = globalThis.LIC.LICENSES[userId];
+      const lic = globalThis.DB.LICENSES[userId];
       if (lic && lic.code === text) {
-        await sendMessage(API, chatId, `✅ Lisensimu aktif sampai ${new Date(lic.exp).toLocaleString()}.`);
+        await sendMessage(chatId, `✅ Lisensi aktif hingga ${formatDate(lic.exp)}.`);
       } else {
-        await sendMessage(API, chatId, `❌ Kode tidak valid atau belum disetujui.`);
+        await sendMessage(chatId, `❌ Kode tidak valid atau belum disetujui.`);
       }
       return;
     }
 
     // Admin commands
     if (text.startsWith("/")) {
-      const parts = text.split(" ");
-      const cmd = parts[0].toLowerCase();
-      const targetId = parseInt(parts[1]);
-
-      // 🔒 Batasi hanya admin
+      const [cmd, arg] = text.split(" ");
       if (!isAdmin) {
-        await sendMessage(API, chatId, "❌ Kamu bukan admin!");
+        await sendMessage(chatId, "❌ Kamu bukan admin!");
         return;
       }
 
       switch (cmd) {
         case "/pending":
-          if (Object.keys(globalThis.LIC.PENDING).length === 0)
-            return await sendMessage(API, chatId, "Tidak ada pembayaran pending.");
-          let list = "📋 Pending pembayaran:\n";
-          for (const p of Object.values(globalThis.LIC.PENDING)) {
-            list += `User ${p.username || p.userId} - kode ${p.code}\n`;
-          }
-          await sendMessage(API, chatId, list);
-          return;
-
+          return sendPending(chatId);
         case "/approve":
-          if (!targetId) return await sendMessage(API, chatId, "Gunakan: /approve <user_id>");
-          const pend = globalThis.LIC.PENDING[targetId];
-          if (!pend) return await sendMessage(API, chatId, "User ini tidak ada di daftar pending.");
-          globalThis.LIC.LICENSES[targetId] = { 
-            code: pend.code, 
-            exp: Date.now() + LICENSE_VALID_DAYS * MS_IN_DAY,
-            groups: [],
-          };
-          delete globalThis.LIC.PENDING[targetId];
-          await sendMessage(API, chatId, `✅ User ${targetId} disetujui.`);
-          await sendMessage(API, targetId, 
-            `✅ Lisensi kamu disetujui!\nKode: <code>${globalThis.LIC.LICENSES[targetId].code}</code>\nBerlaku sampai ${new Date(globalThis.LIC.LICENSES[targetId].exp).toLocaleString()}`
-          );
-          return;
-
+          return approveLicense(chatId, parseInt(arg));
         case "/reject":
-          if (!targetId) return await sendMessage(API, chatId, "Gunakan: /reject <user_id>");
-          delete globalThis.LIC.PENDING[targetId];
-          await sendMessage(API, chatId, `❌ User ${targetId} ditolak.`);
-          await sendMessage(API, targetId, `❌ Pembayaran kamu ditolak. Hubungi admin.`);
-          return;
-
+          return rejectLicense(chatId, parseInt(arg));
         case "/licenses":
-          if (Object.keys(globalThis.LIC.LICENSES).length === 0)
-            return await sendMessage(API, chatId, "Tidak ada lisensi aktif.");
-          let msg = "💼 Lisensi aktif:\n";
-          for (const [id, l] of Object.entries(globalThis.LIC.LICENSES)) {
-            msg += `User ${id} - exp: ${new Date(l.exp).toLocaleString()}\n`;
-          }
-          await sendMessage(API, chatId, msg);
-          return;
-
+          return listLicenses(chatId);
         default:
-          await sendMessage(API, chatId, "📘 Perintah admin:\n/pending\n/approve <id>\n/reject <id>\n/licenses");
-          return;
+          await sendMessage(chatId, "📘 Perintah admin:\n/pending\n/approve <id>\n/reject <id>\n/licenses");
       }
+      return;
     }
   }
 
-  // --- Jika di grup ---
+  // === GROUP ===
   if (msg.new_chat_members) {
     for (const member of msg.new_chat_members) {
       if (member.is_bot) continue;
-      const photoCount = await getProfilePhotoCount(API, member.id);
-      let info = `👋 ${member.first_name} bergabung.\nFoto profil: ${photoCount}`;
-      await sendMessage(API, chatId, info);
+      const photoCount = await getPhotos(member.id);
+      await sendMessage(chatId, `👋 ${member.first_name} bergabung.\nFoto profil: ${photoCount}`);
       if (photoCount === 0) {
-        await sendMessage(API, chatId, `⚠️ ${member.first_name} belum punya foto profil.`);
+        await sendMessage(chatId, `⚠️ ${member.first_name} belum punya foto profil.`);
       }
     }
   }
 }
 
-// ------------------ Utility ------------------
-
-function generateLicenseCode() {
-  const a = () => Math.random().toString(36).substring(2, 8).toUpperCase();
-  return `LS-${a()}-${Math.floor(1000 + Math.random()*9000)}`;
+// === ADMIN HELPERS ===
+async function sendPending(chatId) {
+  const pend = Object.values(globalThis.DB.PENDING);
+  if (pend.length === 0) return sendMessage(chatId, "Tidak ada pembayaran pending.");
+  let msg = "📋 Pending pembayaran:\n";
+  for (const p of pend) {
+    msg += `User ${p.username || p.userId} — kode ${p.code}\n`;
+  }
+  await sendMessage(chatId, msg);
 }
 
-async function sendMessage(API, chatId, text) {
+async function approveLicense(chatId, userId) {
+  const pend = globalThis.DB.PENDING[userId];
+  if (!pend) return sendMessage(chatId, "User tidak ada di daftar pending.");
+  const exp = Date.now() + LICENSE_DAYS * DAY_MS;
+  globalThis.DB.LICENSES[userId] = { code: pend.code, exp };
+  delete globalThis.DB.PENDING[userId];
+  await sendMessage(chatId, `✅ Lisensi disetujui untuk ${userId}.`);
+  await sendMessage(userId, `✅ Lisensi kamu disetujui!\nKode: \`${pend.code}\`\nAktif hingga ${formatDate(exp)}.`, "Markdown");
+}
+
+async function rejectLicense(chatId, userId) {
+  const pend = globalThis.DB.PENDING[userId];
+  if (!pend) return sendMessage(chatId, "User tidak ada di pending.");
+  delete globalThis.DB.PENDING[userId];
+  await sendMessage(chatId, `❌ Pembayaran user ${userId} ditolak.`);
+  await sendMessage(userId, `❌ Pembayaran kamu ditolak. Silakan hubungi admin.`);
+}
+
+async function listLicenses(chatId) {
+  const list = Object.entries(globalThis.DB.LICENSES);
+  if (list.length === 0) return sendMessage(chatId, "Belum ada lisensi aktif.");
+  let msg = "💼 Lisensi aktif:\n";
+  for (const [id, L] of list) {
+    msg += `User ${id} — exp: ${formatDate(L.exp)}\n`;
+  }
+  await sendMessage(chatId, msg);
+}
+
+// === UTIL ===
+function genCode() {
+  return `LS-${Math.random().toString(36).substring(2, 8).toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`;
+}
+
+async function sendMessage(chatId, text, mode = "HTML") {
   await fetch(`${API}/sendMessage`, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+    body: JSON.stringify({ chat_id: chatId, text, parse_mode: mode }),
   });
 }
 
-async function sendPhoto(API, chatId, url, caption = "") {
+async function sendPhoto(chatId, url, caption = "") {
   await fetch(`${API}/sendPhoto`, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -183,16 +193,22 @@ async function sendPhoto(API, chatId, url, caption = "") {
   });
 }
 
-async function getProfilePhotoCount(API, userId) {
+async function getPhotos(userId) {
   try {
     const res = await fetch(`${API}/getUserProfilePhotos?user_id=${userId}&limit=1`);
-    const data = await res.json();
-    return data.ok ? data.result.total_count || 0 : 0;
+    const d = await res.json();
+    return d.ok ? d.result.total_count : 0;
   } catch {
     return 0;
   }
 }
 
-function formatUser(u) {
-  return u.username ? `@${u.username}` : `${u.first_name} (${u.id})`;
-  }
+async function safeSend(chatId, text) {
+  try {
+    await sendMessage(chatId, text);
+  } catch {}
+}
+
+function formatDate(ts) {
+  return new Date(ts).toLocaleString("id-ID");
+    }
