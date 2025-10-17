@@ -1,459 +1,216 @@
-// Satpam Bot PRO+Analytics (Robust command parsing + Panel UX)
-// KV binding required: env.DB
-const TOKEN = "7819500627:AAGR8QKx4G7J-HMBczMVj3GT3aTBgcBLmlo";
-const ADMIN_IDS = [5560906270];
-const API = `https://api.telegram.org/bot${TOKEN}`;
-const QRIS_LINK = "https://raw.githubusercontent.com/Sigitbaberon/qris/refs/heads/main/qr_ID1025423347687_29.09.25_175910930_1759109315016.jpeg";
+/* File: worker.js  (Module Cloudflare Worker) Purpose: Edge Probe UI + safe probe executor for YOUR OWN targets.
 
-const LICENSE_DAYS = 30;
-const DAY_MS = 24 * 3600 * 1000;
-const DEDUP_TTL = 60;
-const DEFAULT_SETTINGS = {
-  antilink: true,
-  antiflood: true,
-  flood_limit: 5,
-  flood_window_seconds: 8,
-  warn_limit: 3
-};
+Included in this single file also is an example wrangler.toml (see bottom comment).
 
-// ---------------- Worker entry ----------------
-export default {
-  async fetch(req, env) {
+BINDINGS expected (configure via wrangler.toml / dashboard):
+
+KV Namespace: LOG_KV
+
+Durable Object: COORDINATOR (class CoordinatorDO)
+
+Environment variables / secrets:
+
+TARGET_ORIGIN (required, e.g. "example.com")
+
+SECRET_HMAC (optional, set with wrangler secret put SECRET_HMAC)
+
+LOG_ENDPOINT (optional webhook for forwarding logs)
+
+SCHEDULE_TARGETS (optional, comma-separated targets)
+
+
+
+IMPORTANT: This Worker performs HTTP GET probes only. Use only for content you own or have permission to test. */
+
+// === Configuration / defaults === const DEFAULT_UAS = [ "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36", "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/120 Mobile Safari/537.36", "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/605.1.15 Safari/605.1.15", ];
+
+const HTML_TEMPLATE = (statusMsg = "", lastResult = null) => `<!doctype html>
+
+<html lang="id">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Edge Probe — Form</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;line-height:1.4;margin:0;padding:24px;background:#f6f8fb;color:#0b1224}
+    .card{max-width:780px;margin:24px auto;padding:20px;border-radius:12px;background:white;box-shadow:0 6px 24px rgba(12,24,48,0.06)}
+    h1{margin:0 0 12px;font-size:20px}
+    form{display:flex;gap:8px;flex-wrap:wrap}
+    input[type="url"]{flex:1;padding:10px;border-radius:8px;border:1px solid #e6e8ee}
+    button{padding:10px 14px;border-radius:8px;border:0;background:#2563eb;color:white;font-weight:600}
+    .small{font-size:13px;color:#525f7a;margin-top:8px}
+    pre{background:#0b1224;color:#e6eef8;padding:12px;border-radius:8px;overflow:auto}
+    .muted{color:#94a3b8;font-size:13px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Edge Probe — Test URL (untuk konten milik Anda)</h1>
+    <p class="small">Masukkan URL halaman yang Anda miliki untuk diuji. Worker ini hanya melakukan HTTP probe (GET) dan menyimpan ringkasan hasil ke KV / webhook (opsional).</p><form id="probeForm" method="POST" action="/submit">
+  <input type="url" name="target" placeholder="https://example.com/your-page" required />
+  <button type="submit">Run Probe</button>
+</form>
+
+<div class="small">Status: ${statusMsg || "ready"}</div>
+${ lastResult ? `<h3>Last result</h3><pre>${JSON.stringify(lastResult, null, 2)}</pre>` : "" }
+<hr/>
+<div class="small">Catatan: Worker menjalankan probe dengan random User-Agent dan menyimpan ringkasan. Pastikan TARGET_ORIGIN diset agar hanya domain Anda yang diizinkan.</div>
+
+  </div>
+</body>
+</html>`;// === Utility helpers === function rand(arr) { return arr[Math.floor(Math.random()*arr.length)]; } function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function signPayload(payloadJson, secret) { if (!secret) return null; const encoder = new TextEncoder(); const keyData = encoder.encode(secret); const key = await crypto.subtle.importKey("raw", keyData, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]); const sig = await crypto.subtle.sign("HMAC", key, encoder.encode(payloadJson)); return Array.from(new Uint8Array(sig)).map(b => b.toString(16).padStart(2, "0")).join(""); }
+
+// === Core probe routine === async function doProbe(targetUrl, env) { const start = Date.now(); const ua = rand(DEFAULT_UAS); const headers = { "User-Agent": ua, "Accept-Language": rand(["en-US,en;q=0.9","id-ID,id;q=0.9"]), "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,/;q=0.8", "X-Edge-Hint": ${env.CF_REGION || "edge"}-${Math.random().toString(36).slice(2,6)}, };
+
+const maxAttempts = 3; let attempt = 0; let res = null; let err = null; let timing = {};
+
+while (attempt < maxAttempts) { attempt++; const t0 = Date.now(); try { res = await fetch(targetUrl, { method: "GET", headers, redirect: "follow" }); const t1 = Date.now(); timing = { start: t0, finish: t1, latency: t1 - t0, attempt }; if (res.status >= 200 && res.status < 400) break; await sleep(200 * Math.pow(2, attempt)); } catch (e) { err = String(e); await sleep(200 * Math.pow(2, attempt)); } }
+
+const end = Date.now(); const summary = { ts: (new Date()).toISOString(), target: targetUrl, status: res ? res.status : null, ok: res ? (res.status >= 200 && res.status < 400) : false, attempt, timing, durationTotalMs: end - start, edgeLocation: env.CF_REGION || env.CF_POD || "edge", ua, error: err, };
+
+if (res && res.headers) { summary.headers = { "content-type": res.headers.get("content-type"), "server": res.headers.get("server"), "cache-control": res.headers.get("cache-control"), }; }
+
+// sign + store to KV + optional webhook try { const key = log:${Date.now()}:${Math.random().toString(36).slice(2,6)}; const payloadJson = JSON.stringify(summary); if (env.SECRET_HMAC) { const signature = await signPayload(payloadJson, env.SECRET_HMAC); summary._sig = signature; } if (env.LOG_KV) { await env.LOG_KV.put(key, JSON.stringify(summary), { expirationTtl: 6060247 }); } if (env.LOG_ENDPOINT) { // best-effort forward (do not forward HTML content) await fetch(env.LOG_ENDPOINT, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source: "edge-probe", payload: summary }) }).catch(()=>{/ ignore webhook errors */}); } } catch (e) { summary.kv_error = String(e); }
+
+return summary; }
+
+// === Worker export === export default { async fetch(request, env, ctx) { const url = new URL(request.url); const pathname = url.pathname;
+
+// Health
+if (pathname === "/_health") return new Response("ok", { status: 200 });
+
+// Root UI
+if (pathname === "/" && request.method === "GET") {
+  return new Response(HTML_TEMPLATE("ready", null), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+// Submit form handler
+if (pathname === "/submit" && request.method === "POST") {
+  const ct = request.headers.get("Content-Type") || "";
+  let formTarget = null;
+  if (ct.includes("application/x-www-form-urlencoded")) {
+    const form = await request.formData();
+    formTarget = form.get("target");
+  } else {
     try {
-      if (req.method !== "POST") return new Response("✅ Satpam PRO+ aktif");
-      const update = await req.json().catch(() => null);
-      if (!update) return new Response("bad json", { status: 400 });
-
-      if (update.message) {
-        const msg = update.message;
-        // dedup by chat+message id to prevent double-processing
-        const dedupKey = `dedup:${msg.chat.id}:${msg.message_id}`;
-        if (await env.DB.get(dedupKey)) return new Response("dup");
-        await env.DB.put(dedupKey, "1", { expirationTtl: DEDUP_TTL });
-        await handleMessage(msg, env);
-      } else if (update.callback_query) {
-        await handleCallback(update.callback_query, env);
-      }
-
-      return new Response("ok");
-    } catch (err) {
-      console.error("Worker error:", err);
-      return new Response("error", { status: 500 });
-    }
+      const j = await request.json().catch(()=>null);
+      formTarget = j && j.target;
+    } catch(e){}
   }
-};
 
-// ---------------- Message handler ----------------
-async function handleMessage(msg, env) {
-  const chatId = msg.chat.id;
-  const text = (msg.text || "").trim();
-  const isPrivate = msg.chat.type === "private";
+  if (!formTarget) {
+    return new Response(HTML_TEMPLATE("Missing target URL", null), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  }
 
-  if (isPrivate) return await handlePrivate(msg, env);
-
-  // handle new_chat_members (bot added or user joined)
-  if (Array.isArray(msg.new_chat_members) && msg.new_chat_members.length) {
-    for (const m of msg.new_chat_members) {
-      if (m.is_bot) {
-        // bot was added to a group
-        const inviterId = msg.from?.id;
-        if (!inviterId) {
-          await sendMessage(chatId, "Bot ditambahkan — inviter tidak terdeteksi.");
-          return;
-        }
-        const lic = await env.DB.get(`license:${inviterId}`);
-        if (!lic) {
-          await sendMessage(chatId, "Pengundang tidak punya lisensi. Bot keluar.");
-          await leaveGroup(chatId);
-          return;
-        }
-        // register group and defaults
-        await env.DB.put(`group:${chatId}`, JSON.stringify({ owner: inviterId, created: Date.now() }));
-        await env.DB.put(`settings:${chatId}`, JSON.stringify(DEFAULT_SETTINGS));
-        // add group to owner's list
-        const og = JSON.parse(await env.DB.get(`owner_groups:${inviterId}`) || "[]");
-        if (!og.includes(String(chatId))) {
-          og.push(String(chatId));
-          await env.DB.put(`owner_groups:${inviterId}`, JSON.stringify(og));
-        }
-        await sendMessage(chatId, `✅ Bot aktif. Pemilik lisensi: [${msg.from.first_name}](tg://user?id=${inviterId})`, "Markdown");
-        return;
-      } else {
-        // normal user joined -> show profile count and maybe warn
-        const profileCount = await getPhotos(m.id);
-        await sendMessage(chatId, `👋 ${m.first_name} bergabung. Foto profil: ${profileCount}`);
-        const groupRaw = await env.DB.get(`group:${chatId}`);
-        if (!groupRaw) continue;
-        const settings = JSON.parse(await env.DB.get(`settings:${chatId}`) || "{}");
-        if (profileCount === 0) await warningSystem(chatId, m.id, env, settings);
-      }
+  // validate URL and enforce TARGET_ORIGIN if set
+  let parsed;
+  try { parsed = new URL(formTarget); } catch (e) {
+    return new Response(HTML_TEMPLATE("Invalid URL format", null), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  }
+  if (env.TARGET_ORIGIN) {
+    if (!parsed.host.endsWith(env.TARGET_ORIGIN)) {
+      return new Response(HTML_TEMPLATE("Target not allowed by TARGET_ORIGIN configuration", null), { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
   }
 
-  // normal group message handling (only if group is registered)
-  if (msg.chat.type && (msg.chat.type.endsWith("group") || msg.chat.type === "supergroup")) {
-    const gid = msg.chat.id;
-    const groupRaw = await env.DB.get(`group:${gid}`);
-    if (!groupRaw) return; // not managed
-    const settings = JSON.parse(await env.DB.get(`settings:${gid}`) || "{}");
-    if (msg.from?.is_bot) return;
-
-    // antilink
-    if (settings.antilink && containsLink(msg)) {
-      await deleteMessage(gid, msg.message_id);
-      await sendMessage(gid, `🚫 ${msg.from.first_name}, link tidak diperbolehkan.`);
-      await warningSystem(gid, msg.from.id, env, settings);
-      return;
+  // Ask Coordinator for permission to avoid floods
+  try {
+    const coordinatorId = env.COORDINATOR.idFromName("global-coordinator");
+    const coordinator = env.COORDINATOR.get(coordinatorId);
+    const allowResp = await coordinator.fetch("/allow", {
+      method: "POST",
+      body: JSON.stringify({ op: "manual-submit" })
+    });
+    if (allowResp.status !== 200) {
+      return new Response(HTML_TEMPLATE("Coordinator denied run; try later", null), { headers: { "Content-Type": "text/html; charset=utf-8" } });
     }
+  } catch (e) {
+    return new Response(HTML_TEMPLATE("Coordinator error", null), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  }
 
-    // antiflood
-    if (settings.antiflood) {
-      const tooMany = await floodIncrement(gid, msg.from.id, env, settings);
-      if (tooMany) {
-        await sendMessage(gid, `⚠️ ${msg.from.first_name} terdeteksi flood.`);
-        await warningSystem(gid, msg.from.id, env, settings);
-      }
+  // Schedule background probe and return immediate response
+  ctx.waitUntil((async () => {
+    await doProbe(formTarget, env);
+  })());
+
+  return new Response(HTML_TEMPLATE("Probe scheduled — check logs (KV/webhook) for results", null), { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+// Manual run API (JSON) - for advanced users
+if (pathname === "/api/run" && (request.method === "POST" || request.method === "PUT")) {
+  try {
+    const payload = await request.json();
+    const target = payload && payload.target;
+    if (!target) return new Response(JSON.stringify({ error: 'missing target' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+    if (env.TARGET_ORIGIN) {
+      const host = new URL(target).host;
+      if (!host.endsWith(env.TARGET_ORIGIN)) return new Response(JSON.stringify({ error: 'target not allowed' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
     }
+    // Coordinator check
+    const coordinatorId = env.COORDINATOR.idFromName("global-coordinator");
+    const coordinator = env.COORDINATOR.get(coordinatorId);
+    const allowResp = await coordinator.fetch("/allow", { method: 'POST', body: JSON.stringify({ op: 'api-run' }) });
+    if (allowResp.status !== 200) return new Response(JSON.stringify({ error: 'coordinator denied' }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+
+    // Run probe async and return immediately
+    ctx.waitUntil(doProbe(target, env));
+    return new Response(JSON.stringify({ status: 'scheduled' }), { status: 202, headers: { 'Content-Type': 'application/json' } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e) }), { status: 500, headers: { 'Content-Type': 'application/json' } });
   }
 }
 
-// ---------------- Private commands (robust parsing) ----------------
-async function handlePrivate(msg, env) {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-  const raw = (msg.text || "").trim();
+return new Response('Not found', { status: 404 });
 
-  // normalize command: accept /cmd, /cmd@BotUser, and lines with extra spaces
-  const normalized = normalizeCommand(raw);
-  const cmd = normalized.command; // e.g. "/panel"
-  const args = normalized.args;   // array of args
+},
 
-  // help/start
-  if (cmd === "/start" || cmd === "/help") {
-    await sendPhoto(chatId, QRIS_LINK, "📷 Scan QRIS untuk bayar lisensi 30 hari.");
-    return sendMessage(chatId,
-      `👋 Halo ${msg.from.first_name}!\n\n` +
-      `Perintah pribadi:\n` +
-      `/status - lihat status lisensi\n` +
-      `/addgroup <chat_id> - daftarkan grup (bot harus admin di grup)\n` +
-      `/mygroups - lihat grup yang kamu daftar\n` +
-      `/panel <chat_id> - buka panel kontrol (atau /panel tanpa arg untuk daftar)\n\n` +
-      `Admin pusat: /pending /approve <id|kode> /reject <id|kode> /licenses`,
-      "Markdown"
-    );
-  }
+// Scheduled cron trigger: runs on many edges, coordinator will gate global throughput async scheduled(controller, env, ctx) { const tasks = env.SCHEDULE_TARGETS ? env.SCHEDULE_TARGETS.split(',').map(s => s.trim()).filter(Boolean) : []; if (tasks.length === 0 && env.TARGET_ORIGIN) tasks.push(https://${env.TARGET_ORIGIN}/); if (tasks.length === 0) return;
 
-  // handle photo as payment proof
-  if (msg.photo?.length) {
-    const file = msg.photo[msg.photo.length - 1];
-    const code = genCode();
-    await env.DB.put(`pending:${userId}`, JSON.stringify({ userId, fileId: file.file_id, code, ts: Date.now() }));
-    await sendMessage(chatId, `✅ Bukti diterima. Kode: \`${code}\`. Tunggu verifikasi admin.`, "Markdown");
-    for (const a of ADMIN_IDS) await sendMessage(a, `💰 Bukti baru: [${msg.from.first_name}](tg://user?id=${userId})\nKode: \`${code}\``, "Markdown");
-    return;
-  }
-
-  // non-command text -> ignore
-  if (!cmd) return;
-
-  // admin-only commands guard
-  if (["/pending","/approve","/reject","/licenses"].includes(cmd) && !ADMIN_IDS.includes(userId))
-    return sendMessage(chatId, "🚫 Kamu bukan admin pusat!");
-
-  // command routing
-  switch (cmd) {
-    case "/status": return statusHandler(chatId, env, userId);
-    case "/addgroup": return addGroupHandler(chatId, env, userId, args[0]);
-    case "/mygroups": return myGroups(chatId, env, userId);
-    case "/panel": return panelCommand(chatId, env, userId, args);
-    case "/pending": return listPending(chatId, env);
-    case "/approve": return approveHandler(chatId, env, args[0]);
-    case "/reject": return rejectHandler(chatId, env, args[0]);
-    case "/licenses": return listLicenses(chatId, env);
-    default:
-      return sendMessage(chatId, "Perintah tidak dikenal. Gunakan /help");
-  }
+// Coordinator ask
+try {
+  const coordinatorId = env.COORDINATOR.idFromName("global-coordinator");
+  const coordinator = env.COORDINATOR.get(coordinatorId);
+  const allowResp = await coordinator.fetch("/allow", { method: "POST", body: JSON.stringify({ op: "cron", edgesite: env.CF_POD ? env.CF_POD : "edge" }) });
+  if (allowResp.status !== 200) return; // denied
+} catch (e) {
+  return; // coordinator error
 }
 
-// ---------------- Panel command + UX ----------------
-async function panelCommand(chatId, env, args) {
-  // if user provided group id -> open panel
-  if (args && args[0]) {
-    return openPanelHandler(chatId, env, null, args[0]); // user check happens in openPanelHandler
-  }
-  // else list user's groups and show buttons
-  const caller = (await getCallerIdFromChat(chatId)); // chatId == userId in private
-  const ownerGroups = JSON.parse(await env.DB.get(`owner_groups:${caller}`) || "[]");
-  if (ownerGroups.length === 0) return sendMessage(chatId, "Kamu belum mendaftarkan grup. Gunakan /addgroup <chat_id>");
-
-  const rows = ownerGroups.map(gid => ([{ text: `⚙️ ${gid}`, callback_data: `open:${gid}:none` }]));
-  // add refresh
-  rows.push([{ text: "🔄 Refresh", callback_data: `refresh_list:${caller}:none` }]);
-
-  await sendMessage(chatId, "📁 Grup milikmu — pilih untuk buka panel:", "HTML", { inline_keyboard: rows });
+for (const target of tasks) {
+  const jitter = Math.floor(Math.random() * 800) + 200;
+  await sleep(jitter);
+  ctx.waitUntil(doProbe(target, env));
 }
 
-// helper to get user id from private chat (chatId equals user id)
-function getCallerIdFromChat(chatId) { return Promise.resolve(String(chatId)); }
+} };
 
-// openPanelHandler now accepts userId optional (if null will derive from chat)
-async function openPanelHandler(chatId, env, userId, gid) {
-  // if userId not passed, chatId is private user -> use chatId
-  const caller = userId || String(chatId);
-  if (!gid) return sendMessage(chatId, "Gunakan: /panel <group_id>");
-  const gRaw = await env.DB.get(`group:${gid}`);
-  if (!gRaw) return sendMessage(chatId, "❌ Grup belum terdaftar.");
-  const g = JSON.parse(gRaw);
-  if (String(g.owner) !== String(caller)) return sendMessage(chatId, "🚫 Kamu bukan pemilik grup ini.");
+// === Durable Object Coordinator === export class CoordinatorDO { constructor(state, env) { this.state = state; this.env = env; this.metaKey = 'meta'; }
 
-  const s = JSON.parse(await env.DB.get(`settings:${gid}`) || JSON.stringify(DEFAULT_SETTINGS));
-  const markup = { inline_keyboard: makePanelButtons(gid, s) };
+async fetch(req) { const url = new URL(req.url); if (url.pathname === '/allow') { try { const body = await req.json().catch(()=>({})); const now = Date.now(); const metaRaw = await this.state.get(this.metaKey) || '{}'; const meta = typeof metaRaw === 'string' ? JSON.parse(metaRaw) : metaRaw; const windowMs = 60 * 1000; // 1 minute window const limitPerWindow = 200; // conservative global threshold meta.calls = (meta.calls || []).filter(t => (now - t) < windowMs); if (meta.calls.length >= limitPerWindow) { await this.state.put(this.metaKey, JSON.stringify(meta)); return new Response(JSON.stringify({ ok:false, reason: 'limit' }), { status: 429, headers: { 'Content-Type': 'application/json' } }); } meta.calls.push(now); await this.state.put(this.metaKey, JSON.stringify(meta)); return new Response(JSON.stringify({ ok:true }), { status: 200, headers: { 'Content-Type': 'application/json' } }); } catch (e) { return new Response('error', { status: 500 }); } } return new Response('not found', { status: 404 }); } }
 
-  // notify admin log that panel opened (helpful)
-  for (const a of ADMIN_IDS) {
-    await sendMessage(a, `ℹ️ Panel dibuka oleh ${caller} untuk grup ${gid}`);
-  }
+/* Example wrangler.toml (paste to your project root and fill IDs/secrets):
 
-  return sendMessage(chatId, makePanelText(gid, s), "HTML", markup);
-}
+name = "edge-probe-ui" main = "index.js" compatibility_date = "2025-10-17"
 
-// ---------------- Callback handler (panel interactions + list open) ----------------
-async function handleCallback(q, env) {
-  // simple safety
-  if (!q || !q.data) return;
-  const fromId = String(q.from.id);
-  const chatId = q.message.chat.id;
-  const msgId = q.message.message_id;
-  const parts = q.data.split(":");
-  const action = parts[0];
-  const gid = parts[1];
-  const key = parts[2];
+[[durable_objects]] name = "COORDINATOR" class_name = "CoordinatorDO"
 
-  // special open list action
-  if (action === "open") {
-    // open panel for gid
-    // reply to user who clicked by opening panel in their private chat (use their id)
-    return openPanelHandler(fromId, env, fromId, gid);
-  }
-  if (action === "refresh_list") {
-    // rebuild list for user
-    const caller = gid; // here gid contains caller id
-    const ownerGroups = JSON.parse(await env.DB.get(`owner_groups:${caller}`) || "[]");
-    if (ownerGroups.length === 0) {
-      await answerCallback(q.id, "Kamu tidak memiliki grup terdaftar.");
-      return;
-    }
-    const rows = ownerGroups.map(g => ([{ text: `⚙️ ${g}`, callback_data: `open:${g}:none` }]));
-    rows.push([{ text: "🔄 Refresh", callback_data: `refresh_list:${caller}:none` }]);
-    await editMessage(chatId, msgId, "📁 Grup milikmu — pilih untuk buka panel:", { inline_keyboard: rows });
-    await answerCallback(q.id, "Di-refresh");
-    return;
-  }
+[[kv_namespaces]] binding = "LOG_KV" id = "<YOUR_KV_NAMESPACE_ID>"
 
-  // for panel actions we must verify owner
-  const gRaw = await env.DB.get(`group:${gid}`);
-  if (!gRaw) {
-    await answerCallback(q.id, "Grup tidak terdaftar.");
-    return;
-  }
-  const g = JSON.parse(gRaw);
-  if (String(g.owner) !== fromId) {
-    await answerCallback(q.id, "Kamu bukan pemilik grup ini.");
-    return;
-  }
+[vars] TARGET_ORIGIN = "shope.com" SCHEDULE_TARGETS = "https://yourdomain.com/video1,https://yourdomain.com/video2" LOG_ENDPOINT = "" # optional webhook
 
-  // load settings
-  let s = JSON.parse(await env.DB.get(`settings:${gid}`) || JSON.stringify(DEFAULT_SETTINGS));
+SECRET_HMAC should be set with wrangler secret put SECRET_HMAC "your-secret"
 
-  switch (action) {
-    case "toggle":
-      s[key] = !Boolean(s[key]);
-      break;
-    case "inc":
-      s[key] = (Number(s[key] || 0) + 1);
-      break;
-    case "dec":
-      s[key] = Math.max(0, (Number(s[key] || 0) - 1));
-      break;
-    case "reset":
-      s = { ...DEFAULT_SETTINGS };
-      break;
-    case "stats":
-      // produce a stats message (warns top)
-      const warns = await env.DB.list({ prefix: `warns:${gid}:` });
-      let arr = [];
-      for (const k of warns.keys) {
-        const val = Number(await env.DB.get(k.name) || 0);
-        const uid = k.name.split(":").pop();
-        arr.push({ uid, val });
-      }
-      arr.sort((a,b)=>b.val-a.val);
-      let txt = `📊 Top offenders for ${gid}:\n`;
-      if (arr.length === 0) txt += "Tidak ada data peringatan.";
-      else arr.slice(0,10).forEach((r,i)=> txt += `${i+1}. ${r.uid} — ${r.val} warn(s)\n`);
-      await answerCallback(q.id, "Menampilkan stats");
-      await sendMessage(fromId, txt);
-      return;
-    default:
-      await answerCallback(q.id, "Aksi tidak dikenal");
-      return;
-  }
+[[triggers]] crons = ["*/5 * * * *"]
 
-  // save and update panel
-  await env.DB.put(`settings:${gid}`, JSON.stringify(s));
-  await answerCallback(q.id, "✅ Disimpan");
-  await editMessage(chatId, msgId, makePanelText(gid, s), { inline_keyboard: makePanelButtons(gid, s) });
-}
+Notes:
 
-// ---------------- Panel UI helpers ----------------
-function makePanelText(gid, s) {
-  return `⚙️ <b>Panel Grup:</b> <code>${gid}</code>\n\n` +
-    `🔗 Antilink: <b>${s.antilink ? "✅ ON" : "❌ OFF"}</b>\n` +
-    `💬 Antiflood: <b>${s.antiflood ? "✅ ON" : "❌ OFF"}</b>\n` +
-    `📊 Flood limit: ${s.flood_limit}\n` +
-    `⏳ Window: ${s.flood_window_seconds}s\n` +
-    `⚠️ Warn limit: ${s.warn_limit}`;
-}
+Replace <YOUR_KV_NAMESPACE_ID> with the KV namespace id from Cloudflare dashboard.
 
-function makePanelButtons(gid, s) {
-  return [
-    [
-      { text: `🔗 ${s.antilink ? "Antilink ON ✅" : "Antilink OFF ❌"}`, callback_data: `toggle:${gid}:antilink` },
-      { text: `💬 ${s.antiflood ? "Antiflood ON ✅" : "Antiflood OFF ❌"}`, callback_data: `toggle:${gid}:antiflood` }
-    ],
-    [
-      { text: "➕ Flood", callback_data: `inc:${gid}:flood_limit` },
-      { text: "➖ Flood", callback_data: `dec:${gid}:flood_limit` },
-      { text: "⏱ Window ➕", callback_data: `inc:${gid}:flood_window_seconds` },
-      { text: "⏱ Window ➖", callback_data: `dec:${gid}:flood_window_seconds` }
-    ],
-    [
-      { text: "⚠️ Warn ➕", callback_data: `inc:${gid}:warn_limit` },
-      { text: "⚠️ Warn ➖", callback_data: `dec:${gid}:warn_limit` },
-      { text: "📊 Stats", callback_data: `stats:${gid}:none` },
-      { text: "♻️ Reset", callback_data: `reset:${gid}:none` }
-    ]
-  ];
-}
+Use wrangler secret put SECRET_HMAC to store SECRET_HMAC securely.
 
-// ---------------- Commands implement (same as before) ----------------
-async function addGroupHandler(chatId, env, userId, gid) {
-  const lic = await env.DB.get(`license:${userId}`);
-  if (!lic) return sendMessage(chatId, "❌ Kamu belum berlisensi.");
-  if (!gid) return sendMessage(chatId, "Gunakan: /addgroup <chat_id>");
-  await env.DB.put(`group:${gid}`, JSON.stringify({ owner: userId, created: Date.now() }));
-  await env.DB.put(`settings:${gid}`, JSON.stringify(DEFAULT_SETTINGS));
-  const ownerGroups = JSON.parse(await env.DB.get(`owner_groups:${userId}`) || "[]");
-  if (!ownerGroups.includes(String(gid))) { ownerGroups.push(String(gid)); await env.DB.put(`owner_groups:${userId}`, JSON.stringify(ownerGroups)); }
-  return sendMessage(chatId, `✅ Grup ${gid} terdaftar. Buka /panel ${gid}`);
-}
+Deploy with wrangler publish. */
 
-async function myGroups(chatId, env, userId) {
-  const arr = JSON.parse(await env.DB.get(`owner_groups:${userId}`) || "[]");
-  if (!arr.length) return sendMessage(chatId, "Kamu belum mendaftarkan grup.");
-  return sendMessage(chatId, "📋 Grup milikmu:\n" + arr.map(g => `• ${g}`).join("\n"));
-}
 
-async function statusHandler(chatId, env, userId) {
-  const licRaw = await env.DB.get(`license:${userId}`);
-  if (!licRaw) return sendMessage(chatId, "Lisensi: ❌ Tidak aktif");
-  const L = JSON.parse(licRaw);
-  return sendMessage(chatId, `Lisensi: ${L.code}\nAktif sampai: ${formatDate(L.exp)}`);
-}
-
-// pending/approve/reject/licenses (same logic as before)
-async function listPending(chatId, env) {
-  const lst = await env.DB.list({ prefix: "pending:" });
-  if (!lst.keys || lst.keys.length === 0) return sendMessage(chatId, "Tidak ada pending.");
-  let out = "📋 Pending:\n";
-  for (const k of lst.keys) { const p = JSON.parse(await env.DB.get(k.name)); out += `• ${p.userId} — ${p.code}\n`; }
-  return sendMessage(chatId, out);
-}
-async function approveHandler(chatId, env, arg) {
-  if (!arg) return sendMessage(chatId, "Gunakan: /approve <user_id|kode>");
-  let data = await env.DB.get(`pending:${arg}`); let key = `pending:${arg}`;
-  if (!data) {
-    const list = await env.DB.list({ prefix: "pending:" });
-    for (const k of list.keys) { const raw = await env.DB.get(k.name); if (!raw) continue; const p = JSON.parse(raw); if (p.code === arg) { data = raw; key = k.name; break; } }
-  }
-  if (!data) return sendMessage(chatId, "❌ Tidak ditemukan di pending.");
-  const p = JSON.parse(data); const exp = Date.now() + LICENSE_DAYS * DAY_MS;
-  await env.DB.put(`license:${p.userId}`, JSON.stringify({ code: p.code, exp, owner: p.userId })); await env.DB.delete(key);
-  await sendMessage(chatId, `✅ Approved: ${p.userId}`); await sendMessage(p.userId, `✅ Lisensi aktif sampai ${formatDate(exp)}. Kode: ${p.code}`);
-}
-async function rejectHandler(chatId, env, arg) {
-  if (!arg) return sendMessage(chatId, "Gunakan: /reject <user_id|kode>");
-  let data = await env.DB.get(`pending:${arg}`); let key = `pending:${arg}`;
-  if (!data) {
-    const list = await env.DB.list({ prefix: "pending:" });
-    for (const k of list.keys) { const raw = await env.DB.get(k.name); if (!raw) continue; const p = JSON.parse(raw); if (p.code === arg) { data = raw; key = k.name; break; } }
-  }
-  if (!data) return sendMessage(chatId, "❌ Tidak ditemukan di pending.");
-  const p = JSON.parse(data); await env.DB.delete(key);
-  await sendMessage(chatId, `❌ Rejected: ${p.userId}`); await sendMessage(p.userId, `❌ Pembayaran ditolak. Hubungi admin.`);
-}
-async function listLicenses(chatId, env) {
-  const lst = await env.DB.list({ prefix: "license:" });
-  if (!lst.keys || lst.keys.length === 0) return sendMessage(chatId, "Belum ada lisensi.");
-  let out = "💼 Lisensi aktif:\n"; for (const k of lst.keys) { const L = JSON.parse(await env.DB.get(k.name)); const uid = k.name.replace("license:", ""); out += `• ${uid} — sampai ${formatDate(L.exp)} — ${L.code}\n`; }
-  return sendMessage(chatId, out);
-}
-
-// ---------------- Utilities ----------------
-function normalizeCommand(text) {
-  // returns { command: "/cmd" or null, args: [] }
-  if (!text) return { command: null, args: [] };
-  // split by whitespace, remove empty
-  const parts = text.trim().split(/\s+/).filter(Boolean);
-  if (!parts.length) return { command: null, args: [] };
-  // command could be "/cmd" or "/cmd@BotUser"
-  const rawCmd = parts[0].toLowerCase();
-  const m = rawCmd.match(/^\/[a-z0-9_]+(?:@[a-z0-9_]+)?$/i);
-  if (!m) return { command: null, args: [] };
-  const cmd = rawCmd.split("@")[0]; // remove bot mention
-  const args = parts.slice(1);
-  return { command: cmd, args };
-}
-
-function containsLink(msg) {
-  const t = msg.text || msg.caption || "";
-  return /(https?:\/\/|t\.me\/|telegram\.me|\.com|\.net|\.xyz)/i.test(t);
-}
-
-function genCode() { return `LS-${Math.random().toString(36).substring(2, 8).toUpperCase()}-${Math.floor(1000 + Math.random() * 9000)}`; }
-function formatDate(ts) { return new Date(ts).toLocaleString("id-ID"); }
-
-async function floodIncrement(gid, uid, env, s) {
-  const key = `flood:${gid}:${uid}`;
-  const raw = await env.DB.get(key);
-  let obj = raw ? JSON.parse(raw) : { count: 0, ts: Date.now() };
-  const now = Date.now();
-  const windowSec = s.flood_window_seconds || DEFAULT_SETTINGS.flood_window_seconds;
-  const limit = s.flood_limit || DEFAULT_SETTINGS.flood_limit;
-  if (now - obj.ts > windowSec * 1000) obj = { count: 1, ts: now };
-  else obj.count++;
-  await env.DB.put(key, JSON.stringify(obj), { expirationTtl: windowSec + 5 });
-  return obj.count > limit;
-}
-
-async function warningSystem(gid, uid, env, s) {
-  const limit = s.warn_limit || DEFAULT_SETTINGS.warn_limit;
-  const key = `warns:${gid}:${uid}`;
-  const now = Number(await env.DB.get(key) || 0) + 1;
-  await env.DB.put(key, String(now), { expirationTtl: 86400 });
-  await sendMessage(gid, `⚠️ User (${uid}) peringatan ${now}/${limit}.`);
-  if (now >= limit) {
-    try {
-      await fetch(`${API}/kickChatMember`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ chat_id: gid, user_id: uid }) });
-      await sendMessage(gid, `🚫 User (${uid}) dikeluarkan setelah ${now} peringatan.`);
-      await env.DB.delete(key);
-    } catch (e) {
-      await sendMessage(gid, `Gagal mengeluarkan user (${uid}).`);
-    }
-  }
-}
-
-// ------------- Telegram API helpers -------------
-async function sendMessage(chatId, text, mode = "HTML", reply_markup = null) {
-  const body = { chat_id: String(chatId), text, parse_mode: mode, disable_web_page_preview: true };
-  if (reply_markup) body.reply_markup =
+  
